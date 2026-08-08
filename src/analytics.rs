@@ -1,10 +1,10 @@
 //! High-level asynchronous Segment client with bounded background batching.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use jiff::Timestamp;
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::{
     AutoBatcher, Batcher, Client, Error, HttpClient, Result, ValidationError,
@@ -15,6 +15,7 @@ use crate::{
 const DEFAULT_FLUSH_AT: usize = 20;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_QUEUE_SIZE: usize = 10_000;
+const DEFAULT_EVENT_BUFFER_SIZE: usize = 1_024;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What to do when the bounded background queue is full.
@@ -28,8 +29,70 @@ pub enum OverflowPolicy {
     Reject,
 }
 
+/// Why the delivery worker attempted to flush buffered messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushReason {
+    /// The serialized Tracking API batch reached its capacity.
+    Capacity,
+    /// The configured message-count threshold was reached.
+    MessageCount,
+    /// The configured flush interval elapsed.
+    Interval,
+    /// The application explicitly requested a flush.
+    Manual,
+    /// The application is draining the client during shutdown.
+    Shutdown,
+}
+
+/// A non-blocking lifecycle event emitted by [`Analytics`].
+///
+/// Subscribe with [`Analytics::subscribe`]. Slow subscribers can lag and lose
+/// events, but they never delay event delivery to Segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnalyticsEvent {
+    /// A message was accepted into the bounded worker queue.
+    Enqueued {
+        message_id: String,
+        message_type: &'static str,
+    },
+    /// A middleware intentionally filtered a message out.
+    Dropped { message_type: &'static str },
+    /// One or more messages were delivered successfully.
+    Delivered {
+        message_count: usize,
+        reason: FlushReason,
+    },
+    /// A delivery failed. The loss-safe batch remains available for a retry.
+    DeliveryFailed {
+        message_count: usize,
+        reason: FlushReason,
+        error: String,
+    },
+    /// A message was rejected by the configured queue overflow policy.
+    QueueFull { message_type: &'static str },
+    /// The background client drained and stopped.
+    Closed,
+}
+
+/// An ordered message transformation applied before validation and enqueueing.
+///
+/// Returning `Ok(None)` intentionally drops a message. Returning an error
+/// rejects it without changing the queue. Middleware runs in the producer task,
+/// so expensive work should be performed before calling [`Analytics::enqueue`].
+pub trait Middleware: Send + Sync {
+    fn process(&self, message: BatchMessage) -> Result<Option<BatchMessage>>;
+}
+
+impl<F> Middleware for F
+where
+    F: Fn(BatchMessage) -> Result<Option<BatchMessage>> + Send + Sync,
+{
+    fn process(&self, message: BatchMessage) -> Result<Option<BatchMessage>> {
+        self(message)
+    }
+}
+
 /// Builder for a high-level [`Analytics`] client.
-#[derive(Debug)]
 pub struct AnalyticsBuilder<C = HttpClient> {
     client: C,
     write_key: String,
@@ -39,6 +102,26 @@ pub struct AnalyticsBuilder<C = HttpClient> {
     overflow_policy: OverflowPolicy,
     batch_context: Option<Value>,
     auto_timestamp: bool,
+    middleware: Vec<Arc<dyn Middleware>>,
+    event_buffer_size: usize,
+}
+
+impl<C: fmt::Debug> fmt::Debug for AnalyticsBuilder<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticsBuilder")
+            .field("client", &self.client)
+            .field("write_key", &"[redacted]")
+            .field("flush_at", &self.flush_at)
+            .field("flush_interval", &self.flush_interval)
+            .field("max_queue_size", &self.max_queue_size)
+            .field("overflow_policy", &self.overflow_policy)
+            .field("batch_context", &self.batch_context)
+            .field("auto_timestamp", &self.auto_timestamp)
+            .field("middleware_count", &self.middleware.len())
+            .field("event_buffer_size", &self.event_buffer_size)
+            .finish()
+    }
 }
 
 impl AnalyticsBuilder<HttpClient> {
@@ -60,6 +143,8 @@ impl<C> AnalyticsBuilder<C> {
             overflow_policy: OverflowPolicy::Block,
             batch_context: None,
             auto_timestamp: true,
+            middleware: Vec::new(),
+            event_buffer_size: DEFAULT_EVENT_BUFFER_SIZE,
         }
     }
 
@@ -99,6 +184,18 @@ impl<C> AnalyticsBuilder<C> {
         self
     }
 
+    /// Add an ordered message enrichment or filtering step.
+    pub fn middleware(mut self, middleware: impl Middleware + 'static) -> Self {
+        self.middleware.push(Arc::new(middleware));
+        self
+    }
+
+    /// Bound each lifecycle-event subscriber's in-memory buffer.
+    pub fn event_buffer_size(mut self, event_buffer_size: usize) -> Self {
+        self.event_buffer_size = event_buffer_size;
+        self
+    }
+
     /// Spawn the background delivery worker on the active Tokio runtime.
     pub fn build(self) -> Result<Analytics>
     where
@@ -115,6 +212,11 @@ impl<C> AnalyticsBuilder<C> {
         }
         if self.max_queue_size == 0 {
             return Err(ValidationError::new("maxQueueSize", "must be greater than zero").into());
+        }
+        if self.event_buffer_size == 0 {
+            return Err(
+                ValidationError::new("eventBufferSize", "must be greater than zero").into(),
+            );
         }
         if self
             .batch_context
@@ -136,12 +238,14 @@ impl<C> AnalyticsBuilder<C> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| Error::RuntimeUnavailable)?;
         let (sender, receiver) = mpsc::channel(self.max_queue_size);
+        let (events, _) = broadcast::channel(self.event_buffer_size);
         let worker = AutoBatcher::new(self.client, batcher, self.write_key);
         runtime.spawn(run_worker(
             receiver,
             worker,
             self.flush_at,
             self.flush_interval,
+            events.clone(),
         ));
 
         Ok(Analytics {
@@ -151,6 +255,8 @@ impl<C> AnalyticsBuilder<C> {
                 overflow_policy: self.overflow_policy,
                 auto_timestamp: self.auto_timestamp,
                 empty_batch_size,
+                middleware: self.middleware,
+                events,
             }),
         })
     }
@@ -158,9 +264,14 @@ impl<C> AnalyticsBuilder<C> {
 
 /// A cloneable Segment client that queues and batches messages in the
 /// background.
-#[derive(Debug)]
 pub struct Analytics {
     inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Analytics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Analytics").finish_non_exhaustive()
+    }
 }
 
 impl Clone for Analytics {
@@ -181,12 +292,30 @@ impl Analytics {
         AnalyticsBuilder::with_client(write_key, client)
     }
 
+    /// Subscribe to delivery lifecycle events.
+    ///
+    /// The returned broadcast receiver reports [`broadcast::error::RecvError::Lagged`]
+    /// if the subscriber cannot keep up with the configured event buffer.
+    pub fn subscribe(&self) -> broadcast::Receiver<AnalyticsEvent> {
+        self.inner.events.subscribe()
+    }
+
     /// Queue a message for background delivery.
     ///
     /// Success acknowledges acceptance into the local queue, not delivery to
     /// Segment. Call [`Self::flush`] when a delivery acknowledgement is needed.
     pub async fn enqueue(&self, message: impl Into<BatchMessage>) -> Result<()> {
         let mut message = message.into();
+        for middleware in &self.inner.middleware {
+            let message_type = message.message_type();
+            message = match middleware.process(message)? {
+                Some(message) => message,
+                None => {
+                    publish(&self.inner.events, AnalyticsEvent::Dropped { message_type });
+                    return Ok(());
+                }
+            };
+        }
         if self.inner.auto_timestamp && message.timestamp_mut().is_none() {
             *message.timestamp_mut() = Some(Timestamp::now());
         }
@@ -198,28 +327,50 @@ impl Analytics {
         if self.inner.empty_batch_size + message_size > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
         }
+        let message_id = message
+            .message_id()
+            .expect("message preparation generates an ID")
+            .to_owned();
+        let message_type = message.message_type();
 
         let state = self.inner.state.lock().await;
         if *state != State::Open {
             return Err(Error::ClientClosed);
         }
 
-        match self.inner.overflow_policy {
+        let result = match self.inner.overflow_policy {
             OverflowPolicy::Block => self
                 .inner
                 .sender
                 .send(Command::Event(Box::new(message)))
                 .await
                 .map_err(|_| Error::WorkerStopped),
-            OverflowPolicy::Reject => self
+            OverflowPolicy::Reject => match self
                 .inner
                 .sender
                 .try_send(Command::Event(Box::new(message)))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => Error::QueueFull,
-                    mpsc::error::TrySendError::Closed(_) => Error::WorkerStopped,
-                }),
+            {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    publish(
+                        &self.inner.events,
+                        AnalyticsEvent::QueueFull { message_type },
+                    );
+                    Err(Error::QueueFull)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::WorkerStopped),
+            },
+        };
+        if result.is_ok() {
+            publish(
+                &self.inner.events,
+                AnalyticsEvent::Enqueued {
+                    message_id,
+                    message_type,
+                },
+            );
         }
+        result
     }
 
     pub async fn identify(&self, message: Identify) -> Result<()> {
@@ -276,7 +427,10 @@ impl Analytics {
             if self
                 .inner
                 .sender
-                .send(Command::Flush(sender))
+                .send(Command::Flush {
+                    sender,
+                    reason: FlushReason::Shutdown,
+                })
                 .await
                 .is_err()
             {
@@ -305,6 +459,7 @@ impl Analytics {
             .map_err(|_| Error::WorkerStopped)?;
         receiver.await.map_err(|_| Error::WorkerStopped)?;
         *self.inner.state.lock().await = State::Closed;
+        publish(&self.inner.events, AnalyticsEvent::Closed);
         Ok(())
     }
 
@@ -317,7 +472,10 @@ impl Analytics {
             let (sender, receiver) = oneshot::channel();
             self.inner
                 .sender
-                .send(Command::Flush(sender))
+                .send(Command::Flush {
+                    sender,
+                    reason: FlushReason::Manual,
+                })
                 .await
                 .map_err(|_| Error::WorkerStopped)?;
             receiver
@@ -333,13 +491,14 @@ impl Analytics {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     sender: mpsc::Sender<Command>,
     state: Mutex<State>,
     overflow_policy: OverflowPolicy,
     auto_timestamp: bool,
     empty_batch_size: usize,
+    middleware: Vec<Arc<dyn Middleware>>,
+    events: broadcast::Sender<AnalyticsEvent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,7 +510,10 @@ enum State {
 
 enum Command {
     Event(Box<BatchMessage>),
-    Flush(oneshot::Sender<Result<()>>),
+    Flush {
+        sender: oneshot::Sender<Result<()>>,
+        reason: FlushReason,
+    },
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -360,6 +522,7 @@ async fn run_worker<C>(
     mut batcher: AutoBatcher<C>,
     flush_at: usize,
     flush_interval: Duration,
+    events: broadcast::Sender<AnalyticsEvent>,
 ) where
     C: Client + Send + Sync + 'static,
 {
@@ -372,16 +535,16 @@ async fn run_worker<C>(
             command = receiver.recv() => match command {
                 Some(Command::Event(message)) => {
                     accepted_since_flush += 1;
-                    let result = batcher.push(*message).await;
+                    let result = push_observed(&mut batcher, *message, &events).await;
                     if result.is_ok()
                         && accepted_since_flush >= flush_at
-                        && batcher.flush().await.is_ok()
+                        && flush_observed(&mut batcher, FlushReason::MessageCount, &events).await.is_ok()
                     {
                         accepted_since_flush = 0;
                     }
                 }
-                Some(Command::Flush(sender)) => {
-                    let result = batcher.flush().await;
+                Some(Command::Flush { sender, reason }) => {
+                    let result = flush_observed(&mut batcher, reason, &events).await;
                     if result.is_ok() {
                         accepted_since_flush = 0;
                     }
@@ -392,18 +555,97 @@ async fn run_worker<C>(
                     break;
                 }
                 None => {
-                    let _ = batcher.flush().await;
+                    let _ = flush_observed(&mut batcher, FlushReason::Shutdown, &events).await;
                     break;
                 }
             },
             () = &mut timer => {
-                if batcher.flush().await.is_ok() {
+                if flush_observed(&mut batcher, FlushReason::Interval, &events).await.is_ok() {
                     accepted_since_flush = 0;
                 }
                 timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
         }
     }
+}
+
+async fn push_observed<C>(
+    batcher: &mut AutoBatcher<C>,
+    message: BatchMessage,
+    events: &broadcast::Sender<AnalyticsEvent>,
+) -> Result<()>
+where
+    C: Client,
+{
+    let before = batcher.len();
+    match batcher.push(message).await {
+        Ok(()) => {
+            let after = batcher.len();
+            if after < before + 1 {
+                publish(
+                    events,
+                    AnalyticsEvent::Delivered {
+                        message_count: before + 1 - after,
+                        reason: FlushReason::Capacity,
+                    },
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            publish(
+                events,
+                AnalyticsEvent::DeliveryFailed {
+                    message_count: batcher.len(),
+                    reason: FlushReason::Capacity,
+                    error: error.to_string(),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn flush_observed<C>(
+    batcher: &mut AutoBatcher<C>,
+    reason: FlushReason,
+    events: &broadcast::Sender<AnalyticsEvent>,
+) -> Result<()>
+where
+    C: Client,
+{
+    let message_count = batcher.len();
+    if message_count == 0 {
+        return Ok(());
+    }
+
+    match batcher.flush().await {
+        Ok(()) => {
+            publish(
+                events,
+                AnalyticsEvent::Delivered {
+                    message_count,
+                    reason,
+                },
+            );
+            Ok(())
+        }
+        Err(error) => {
+            publish(
+                events,
+                AnalyticsEvent::DeliveryFailed {
+                    message_count: batcher.len(),
+                    reason,
+                    error: error.to_string(),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+fn publish(events: &broadcast::Sender<AnalyticsEvent>, event: AnalyticsEvent) {
+    let _ = events.send(event);
 }
 
 #[cfg(test)]
@@ -448,6 +690,31 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    #[derive(Clone, Debug)]
+    struct FailOnceClient {
+        sent: Arc<StdMutex<Vec<Message>>>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl Client for FailOnceClient {
+        fn send<'a>(
+            &'a self,
+            _write_key: &'a str,
+            message: Message,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                return std::future::ready(Err(Error::Middleware(
+                    "simulated delivery failure".to_owned(),
+                )));
+            }
+            self.sent
+                .lock()
+                .expect("recording client lock was poisoned")
+                .push(message);
+            std::future::ready(Ok(()))
+        }
+    }
+
     impl Client for BlockingOnceClient {
         async fn send<'a>(&'a self, _write_key: &'a str, message: Message) -> Result<()> {
             self.sent
@@ -483,6 +750,14 @@ mod tests {
             .sum()
     }
 
+    fn received_events(receiver: &mut broadcast::Receiver<AnalyticsEvent>) -> Vec<AnalyticsEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     #[tokio::test]
     async fn count_flush_delivers_and_close_rejects_late_events() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
@@ -495,7 +770,6 @@ mod tests {
             .flush_interval(Duration::from_secs(60))
             .build()
             .expect("client should build");
-
         analytics
             .track(track("One"))
             .await
@@ -570,6 +844,7 @@ mod tests {
             .overflow_policy(OverflowPolicy::Reject)
             .build()
             .expect("client should build");
+        let mut events = analytics.subscribe();
 
         analytics
             .track(track("One"))
@@ -584,6 +859,12 @@ mod tests {
             analytics.track(track("Three")).await,
             Err(Error::QueueFull)
         ));
+        assert!(received_events(&mut events).iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::QueueFull {
+                message_type: "track"
+            }
+        )));
 
         release.notify_one();
         analytics
@@ -629,5 +910,133 @@ mod tests {
             delivered_message_count(&sent.lock().expect("lock should not be poisoned")),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn middleware_enriches_in_order_and_can_drop_messages() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let client = RecordingClient {
+            sent: Arc::clone(&sent),
+            delivered: Arc::new(Notify::new()),
+        };
+        let analytics = Analytics::builder_with_client("write-key", client)
+            .flush_at(100)
+            .flush_interval(Duration::from_secs(60))
+            .middleware(
+                |mut message: BatchMessage| -> Result<Option<BatchMessage>> {
+                    if let BatchMessage::Track(track) = &mut message {
+                        track
+                            .properties
+                            .as_object_mut()
+                            .expect("test properties should be an object")
+                            .insert("enriched".to_owned(), json!(true));
+                    }
+                    Ok(Some(message))
+                },
+            )
+            .middleware(|message: BatchMessage| -> Result<Option<BatchMessage>> {
+                if matches!(
+                    &message,
+                    BatchMessage::Track(Track { event, properties, .. })
+                        if event == "Drop" && properties["enriched"] == json!(true)
+                ) {
+                    Ok(None)
+                } else {
+                    Ok(Some(message))
+                }
+            })
+            .build()
+            .expect("client should build");
+        let mut events = analytics.subscribe();
+
+        analytics
+            .track(track("Keep"))
+            .await
+            .expect("kept event should queue");
+        analytics
+            .track(track("Drop"))
+            .await
+            .expect("dropped event should be acknowledged");
+        analytics.flush().await.expect("flush should succeed");
+        analytics
+            .close_and_flush()
+            .await
+            .expect("close should succeed");
+
+        let sent = sent.lock().expect("lock should not be poisoned");
+        assert_eq!(delivered_message_count(&sent), 1);
+        let Message::Batch(batch) = &sent[0] else {
+            panic!("background client should send batches");
+        };
+        let BatchMessage::Track(track) = &batch.batch[0] else {
+            panic!("test should deliver a track message");
+        };
+        assert_eq!(track.properties["enriched"], json!(true));
+
+        let events = received_events(&mut events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::Dropped {
+                message_type: "track"
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::Delivered {
+                message_count: 1,
+                reason: FlushReason::Manual
+            }
+        )));
+        assert!(events.contains(&AnalyticsEvent::Closed));
+    }
+
+    #[tokio::test]
+    async fn delivery_events_report_failure_and_loss_safe_retry() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let client = FailOnceClient {
+            sent: Arc::clone(&sent),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let analytics = Analytics::builder_with_client("write-key", client)
+            .flush_at(100)
+            .flush_interval(Duration::from_secs(60))
+            .build()
+            .expect("client should build");
+        let mut events = analytics.subscribe();
+
+        analytics
+            .track(track("Retry"))
+            .await
+            .expect("event should queue");
+        assert!(matches!(analytics.flush().await, Err(Error::Middleware(_))));
+        analytics
+            .flush()
+            .await
+            .expect("retained batch should retry");
+        analytics
+            .close_and_flush()
+            .await
+            .expect("close should succeed");
+
+        assert_eq!(
+            delivered_message_count(&sent.lock().expect("lock should not be poisoned")),
+            1
+        );
+        let events = received_events(&mut events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::DeliveryFailed {
+                message_count: 1,
+                reason: FlushReason::Manual,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::Delivered {
+                message_count: 1,
+                reason: FlushReason::Manual
+            }
+        )));
     }
 }

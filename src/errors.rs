@@ -86,6 +86,9 @@ pub enum Error {
     /// A flush did not finish within the configured timeout.
     #[error("analytics flush timed out after {0:?}")]
     FlushTimeout(std::time::Duration),
+    /// A configured middleware rejected the message.
+    #[error("analytics middleware rejected the message: {0}")]
+    Middleware(String),
     /// The message does not satisfy Segment's Tracking API contract.
     #[error(transparent)]
     ValidationError(#[from] ValidationError),

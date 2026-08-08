@@ -49,6 +49,11 @@ async fn main() -> segment::Result<()> {
 }
 ```
 
+The builder also accepts ordered `.middleware(...)` transformations for
+enrichment and filtering. `analytics.subscribe()` returns a non-blocking
+broadcast stream of enqueue, delivery, failure, queue-pressure, and shutdown
+events for metrics and logging.
+
 The lower-level batching APIs remain available when the application owns its
 delivery loop:
 

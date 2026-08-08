@@ -421,6 +421,28 @@ pub enum BatchMessage {
 }
 
 impl BatchMessage {
+    pub(crate) fn message_type(&self) -> &'static str {
+        match self {
+            Self::Identify(_) => "identify",
+            Self::Track(_) => "track",
+            Self::Page(_) => "page",
+            Self::Screen(_) => "screen",
+            Self::Group(_) => "group",
+            Self::Alias(_) => "alias",
+        }
+    }
+
+    pub(crate) fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::Identify(message) => message.message_id.as_deref(),
+            Self::Track(message) => message.message_id.as_deref(),
+            Self::Page(message) => message.message_id.as_deref(),
+            Self::Screen(message) => message.message_id.as_deref(),
+            Self::Group(message) => message.message_id.as_deref(),
+            Self::Alias(message) => message.message_id.as_deref(),
+        }
+    }
+
     /// Validate this message against the client-side portion of Segment's
     /// Tracking API contract.
     pub fn validate(&self) -> std::result::Result<(), ValidationError> {

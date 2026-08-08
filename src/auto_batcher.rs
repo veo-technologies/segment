@@ -82,6 +82,10 @@ where
         }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.batcher.len() + self.pending.len()
+    }
+
     /// Push a message into the batcher.
     /// If the batcher is full, send it and create a new batcher with the message.
     ///

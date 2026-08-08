@@ -98,6 +98,10 @@ impl Batcher {
         self.buf.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Push a message into the batcher.
     ///
     /// Returns `Ok(None)` if the message was accepted and is now owned by the
