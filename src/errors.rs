@@ -1,6 +1,6 @@
 //! Errors which may arise from this crate.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use reqwest::{StatusCode, header::HeaderMap};
 use thiserror::Error;
@@ -41,6 +41,26 @@ impl fmt::Display for ApiError {
 }
 
 impl std::error::Error for ApiError {}
+
+impl ApiError {
+    /// Whether Segment recommends retrying this response.
+    pub fn is_retryable(&self) -> bool {
+        let status = self.status.as_u16();
+        matches!(status, 408 | 410 | 429 | 460)
+            || (500..600).contains(&status) && !matches!(status, 501 | 505 | 511)
+    }
+
+    /// Delay requested by Segment through `Retry-After` or
+    /// `X-RateLimit-Reset`, when expressed as seconds.
+    pub fn retry_after(&self) -> Option<Duration> {
+        ["retry-after", "x-ratelimit-reset"]
+            .into_iter()
+            .find_map(|name| self.headers.get(name))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+    }
+}
 
 /// An enum of errors this crate may produce.
 #[derive(Error, Debug)]
