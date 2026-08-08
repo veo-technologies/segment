@@ -71,6 +71,21 @@ pub enum Error {
     /// The batch envelope is too large to contain even a single message.
     #[error("batch envelope too large")]
     BatchTooLarge,
+    /// The background delivery queue has reached its configured capacity.
+    #[error("analytics queue is full")]
+    QueueFull,
+    /// The analytics client is closing or has already closed.
+    #[error("analytics client is closed")]
+    ClientClosed,
+    /// The background delivery worker stopped unexpectedly.
+    #[error("analytics delivery worker stopped")]
+    WorkerStopped,
+    /// No Tokio runtime was active when the background client was built.
+    #[error("a Tokio runtime is required to build an Analytics client")]
+    RuntimeUnavailable,
+    /// A flush did not finish within the configured timeout.
+    #[error("analytics flush timed out after {0:?}")]
+    FlushTimeout(std::time::Duration),
     /// The message does not satisfy Segment's Tracking API contract.
     #[error(transparent)]
     ValidationError(#[from] ValidationError),

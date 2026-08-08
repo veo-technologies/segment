@@ -20,6 +20,38 @@ segment = { version = "0.3", default-features = false, features = ["native-tls"]
 
 ## Example usage(s)
 
+For production services, use the bounded background client. It flushes by
+message count or interval and can be drained during graceful shutdown:
+
+```rust,no_run
+use std::time::Duration;
+
+use segment::Analytics;
+use segment::message::{Track, User};
+use serde_json::json;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> segment::Result<()> {
+    let analytics = Analytics::builder("YOUR_WRITE_KEY")
+        .flush_at(20)
+        .flush_interval(Duration::from_secs(5))
+        .max_queue_size(10_000)
+        .build()?;
+
+    analytics.track(Track {
+        user: User::UserId { user_id: "user-123".to_owned() },
+        event: "Example Event".to_owned(),
+        properties: json!({ "source": "rust" }),
+        ..Default::default()
+    }).await?;
+
+    analytics.close_and_flush().await
+}
+```
+
+The lower-level batching APIs remain available when the application owns its
+delivery loop:
+
 ```rust,no_run
 use segment::{HttpClient, Client, AutoBatcher, Batcher};
 use segment::message::{Track, User};

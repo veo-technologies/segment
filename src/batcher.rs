@@ -5,8 +5,8 @@ use crate::{Error, Result, ValidationError};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
-const MAX_MESSAGE_SIZE: usize = 1024 * 32;
-const MAX_BATCH_SIZE: usize = 500_000;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 1024 * 32;
+pub(crate) const MAX_BATCH_SIZE: usize = 500_000;
 
 /// A batcher can accept messages into an internal buffer, and report when
 /// messages must be flushed.

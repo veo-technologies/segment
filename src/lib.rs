@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod analytics;
 mod auto_batcher;
 mod batcher;
 mod client;
@@ -7,6 +8,7 @@ mod errors;
 mod http;
 pub mod message;
 
+pub use analytics::{Analytics, AnalyticsBuilder, OverflowPolicy};
 pub use auto_batcher::AutoBatcher;
 pub use batcher::Batcher;
 pub use client::Client;
