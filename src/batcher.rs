@@ -1,13 +1,12 @@
 //! Utilities for batching up messages.
 
-use crate::message::{Batch, BatchMessage, Message};
-use crate::{Error, Result};
+use crate::message::{Batch, BatchMessage, MAX_BATCH_MESSAGES, Message};
+use crate::{Error, Result, ValidationError};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 32;
 const MAX_BATCH_SIZE: usize = 500_000;
-const MAX_BATCH_MESSAGES: usize = 2_500;
 
 /// A batcher can accept messages into an internal buffer, and report when
 /// messages must be flushed.
@@ -112,11 +111,20 @@ impl Batcher {
     /// Returns an error if the message is too large to be sent to Segment's
     /// API.
     pub fn push(&mut self, msg: impl Into<BatchMessage>) -> Result<Option<BatchMessage>> {
+        if self
+            .context
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(ValidationError::new("context", "must be a JSON object").into());
+        }
+
         let mut msg: BatchMessage = msg.into();
         let timestamp = msg.timestamp_mut();
         if self.auto_timestamp && timestamp.is_none() {
             *timestamp = Some(Timestamp::now());
         }
+        msg.prepare()?;
         let size = serde_json::to_vec(&msg)?.len();
         if size > MAX_MESSAGE_SIZE {
             return Err(Error::MessageTooLarge);
@@ -151,6 +159,7 @@ impl Batcher {
     pub fn into_message(self) -> Message {
         Message::Batch(Batch {
             batch: self.buf,
+            sent_at: Some(Timestamp::now()),
             context: self.context,
             integrations: None,
             extra: Map::default(),
@@ -161,6 +170,7 @@ impl Batcher {
 fn serialized_batch_size(messages: &[BatchMessage], context: Option<&Value>) -> usize {
     serde_json::to_vec(&Batch {
         batch: messages.to_vec(),
+        sent_at: Some(Timestamp::now()),
         context: context.cloned(),
         integrations: None,
         extra: Map::default(),
@@ -175,11 +185,31 @@ mod tests {
     use crate::message::{Track, User};
     use serde_json::json;
 
+    fn library_context() -> Value {
+        json!({
+            "library": {
+                "name": "segment-rust",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        })
+    }
+
+    fn valid_track() -> Track {
+        Track {
+            user: User::UserId {
+                user_id: "user".to_owned(),
+            },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            message_id: Some("test-message".to_owned()),
+            context: Some(library_context()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_push_and_into() {
-        let batch_msg = BatchMessage::Track(Track {
-            ..Default::default()
-        });
+        let batch_msg = BatchMessage::Track(valid_track());
 
         let context = json!({
             "foo": "bar",
@@ -205,7 +235,7 @@ mod tests {
     fn test_push_adds_timestamp() {
         let mut batcher = Batcher::new(None);
         batcher
-            .push(Track::default())
+            .push(valid_track())
             .expect("message should be accepted");
 
         let BatchMessage::Track(track) = &batcher.buf[0] else {
@@ -221,6 +251,10 @@ mod tests {
                 user_id: String::from_utf8(vec![b'a'; 1024 * 33])
                     .expect("test data should be valid UTF-8"),
             },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            message_id: Some("oversized-message".to_owned()),
+            context: Some(library_context()),
             ..Default::default()
         };
 
@@ -238,6 +272,10 @@ mod tests {
                 user_id: String::from_utf8(vec![b'a'; 1024 * 30])
                     .expect("test data should be valid UTF-8"),
             },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            message_id: Some("large-message".to_owned()),
+            context: Some(library_context()),
             ..Default::default()
         };
 
@@ -268,6 +306,10 @@ mod tests {
                 user_id: String::from_utf8(vec![b'a'; 1024 * 30])
                     .expect("test data should be valid UTF-8"),
             },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            message_id: Some("large-message".to_owned()),
+            context: Some(library_context()),
             ..Default::default()
         };
 
@@ -314,7 +356,7 @@ mod tests {
         let mut batcher = Batcher::new(Some(context));
 
         let error = batcher
-            .push(Track::default())
+            .push(valid_track())
             .expect_err("an oversized envelope can never be flushed successfully");
 
         assert!(matches!(error, Error::BatchTooLarge));
@@ -329,7 +371,7 @@ mod tests {
         for _ in 0..MAX_BATCH_MESSAGES {
             assert_eq!(
                 batcher
-                    .push(Track::default())
+                    .push(valid_track())
                     .expect("small message should be valid"),
                 None
             );
@@ -337,7 +379,7 @@ mod tests {
 
         assert!(
             batcher
-                .push(Track::default())
+                .push(valid_track())
                 .expect("small message should be valid")
                 .is_some()
         );

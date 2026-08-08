@@ -184,6 +184,7 @@ where
 
         let message = Message::Batch(Batch {
             batch: buffered.clone(),
+            sent_at: Some(jiff::Timestamp::now()),
             context: self.batcher.context.clone(),
             integrations: None,
             extra: Map::default(),

@@ -29,11 +29,15 @@
 use std::fmt::Display;
 
 use jiff::Timestamp;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde_json::{Map, Value, json};
+
+use crate::{Result, ValidationError};
+
+pub(crate) const MAX_BATCH_MESSAGES: usize = 2_500;
 
 /// An enum containing all values which may be sent to Segment's tracking API.
-#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Message {
     Identify(Identify),
@@ -43,6 +47,107 @@ pub enum Message {
     Group(Group),
     Alias(Alias),
     Batch(Batch),
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("a Segment message must be a JSON object"))?;
+
+        if object.contains_key("batch") {
+            return serde_json::from_value(value)
+                .map(Self::Batch)
+                .map_err(D::Error::custom);
+        }
+
+        let message_type = object
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let inferred_type = message_type.as_deref().or_else(|| {
+            if object.contains_key("event") {
+                Some("track")
+            } else if object.contains_key("groupId") {
+                Some("group")
+            } else if object.contains_key("previousId") {
+                Some("alias")
+            } else if object.contains_key("traits") {
+                Some("identify")
+            } else {
+                None
+            }
+        });
+
+        match inferred_type {
+            Some("identify") => serde_json::from_value(value)
+                .map(Self::Identify)
+                .map_err(D::Error::custom),
+            Some("track") => serde_json::from_value(value)
+                .map(Self::Track)
+                .map_err(D::Error::custom),
+            Some("page") => serde_json::from_value(value)
+                .map(Self::Page)
+                .map_err(D::Error::custom),
+            Some("screen") => serde_json::from_value(value)
+                .map(Self::Screen)
+                .map_err(D::Error::custom),
+            Some("group") => serde_json::from_value(value)
+                .map(Self::Group)
+                .map_err(D::Error::custom),
+            Some("alias") => serde_json::from_value(value)
+                .map(Self::Alias)
+                .map_err(D::Error::custom),
+            Some(other) => Err(D::Error::custom(format!(
+                "unknown Segment message type `{other}`"
+            ))),
+            None => Err(D::Error::custom(
+                "message type is ambiguous; include a `type` field",
+            )),
+        }
+    }
+}
+
+impl Message {
+    /// Validate this message against the client-side portion of Segment's
+    /// Tracking API contract.
+    pub fn validate(&self) -> std::result::Result<(), ValidationError> {
+        match self {
+            Self::Identify(message) => validate_identify(message),
+            Self::Track(message) => validate_track(message),
+            Self::Page(message) => validate_page(message),
+            Self::Screen(message) => validate_screen(message),
+            Self::Group(message) => validate_group(message),
+            Self::Alias(message) => validate_alias(message),
+            Self::Batch(batch) => validate_batch(batch),
+        }
+    }
+
+    pub(crate) fn prepare(&mut self) -> Result<()> {
+        self.validate()?;
+
+        match self {
+            Self::Identify(message) => {
+                prepare_common(&mut message.message_id, &mut message.context)
+            }
+            Self::Track(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Page(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Screen(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Group(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Alias(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Batch(batch) => {
+                for message in &mut batch.batch {
+                    message.prepare()?;
+                }
+                batch.sent_at = Some(Timestamp::now());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// An identify event.
@@ -56,7 +161,12 @@ pub struct Identify {
     pub user: User,
 
     /// The traits to assign to the user.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub traits: Value,
+
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +199,12 @@ pub struct Track {
     pub event: String,
 
     /// The properties associated with the event.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub properties: Value,
+
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,10 +234,16 @@ pub struct Page {
     pub user: User,
 
     /// The name of the page being tracked.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
 
     /// The properties associated with the event.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub properties: Value,
+
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,10 +273,16 @@ pub struct Screen {
     pub user: User,
 
     /// The name of the screen being tracked.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
 
     /// The properties associated with the event.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub properties: Value,
+
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,7 +316,12 @@ pub struct Group {
     pub group_id: String,
 
     /// The traits to assign to the group.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub traits: Value,
+
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +354,10 @@ pub struct Alias {
     #[serde(rename = "previousId")]
     pub previous_id: String,
 
+    /// Unique identifier used by Segment to deduplicate this message.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+
     /// The timestamp associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
@@ -248,6 +384,10 @@ pub struct Alias {
 pub struct Batch {
     /// The batch of messages to send.
     pub batch: Vec<BatchMessage>,
+
+    /// Time at which this batch was sent to Segment.
+    #[serde(rename = "sentAt", skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,6 +421,34 @@ pub enum BatchMessage {
 }
 
 impl BatchMessage {
+    /// Validate this message against the client-side portion of Segment's
+    /// Tracking API contract.
+    pub fn validate(&self) -> std::result::Result<(), ValidationError> {
+        match self {
+            Self::Identify(message) => validate_identify(message),
+            Self::Track(message) => validate_track(message),
+            Self::Page(message) => validate_page(message),
+            Self::Screen(message) => validate_screen(message),
+            Self::Group(message) => validate_group(message),
+            Self::Alias(message) => validate_alias(message),
+        }
+    }
+
+    pub(crate) fn prepare(&mut self) -> Result<()> {
+        self.validate()?;
+        match self {
+            Self::Identify(message) => {
+                prepare_common(&mut message.message_id, &mut message.context)
+            }
+            Self::Track(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Page(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Screen(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Group(message) => prepare_common(&mut message.message_id, &mut message.context),
+            Self::Alias(message) => prepare_common(&mut message.message_id, &mut message.context),
+        }
+        Ok(())
+    }
+
     pub(crate) fn timestamp_mut(&mut self) -> &mut Option<Timestamp> {
         match self {
             Self::Identify(identify) => &mut identify.timestamp,
@@ -290,6 +458,216 @@ impl BatchMessage {
             Self::Group(group) => &mut group.timestamp,
             Self::Alias(alias) => &mut alias.timestamp,
         }
+    }
+}
+
+fn validate_identify(message: &Identify) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, false)?;
+    validate_object_or_null("traits", &message.traits)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["traits"],
+    )
+}
+
+fn validate_track(message: &Track) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, false)?;
+    validate_non_empty("event", &message.event)?;
+    validate_object_or_null("properties", &message.properties)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["event", "properties"],
+    )
+}
+
+fn validate_page(message: &Page) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, false)?;
+    validate_object_or_null("properties", &message.properties)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["name", "properties"],
+    )
+}
+
+fn validate_screen(message: &Screen) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, false)?;
+    validate_object_or_null("properties", &message.properties)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["name", "properties"],
+    )
+}
+
+fn validate_group(message: &Group) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, false)?;
+    validate_non_empty("groupId", &message.group_id)?;
+    validate_object_or_null("traits", &message.traits)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["groupId", "traits"],
+    )
+}
+
+fn validate_alias(message: &Alias) -> std::result::Result<(), ValidationError> {
+    validate_user(&message.user, true)?;
+    validate_non_empty("previousId", &message.previous_id)?;
+    validate_common(
+        message.message_id.as_deref(),
+        message.context.as_ref(),
+        message.integrations.as_ref(),
+        &message.extra,
+        &["previousId"],
+    )
+}
+
+fn validate_batch(batch: &Batch) -> std::result::Result<(), ValidationError> {
+    if batch.batch.is_empty() {
+        return Err(ValidationError::new(
+            "batch",
+            "must contain at least one message",
+        ));
+    }
+    if batch.batch.len() > MAX_BATCH_MESSAGES {
+        return Err(ValidationError::new(
+            "batch",
+            format!("must contain no more than {MAX_BATCH_MESSAGES} messages"),
+        ));
+    }
+    validate_optional_object("context", batch.context.as_ref())?;
+    validate_optional_object("integrations", batch.integrations.as_ref())?;
+    validate_extra_fields(
+        &batch.extra,
+        &["batch", "sentAt", "context", "integrations", "writeKey"],
+    )?;
+    for (index, message) in batch.batch.iter().enumerate() {
+        message.validate().map_err(|error| {
+            ValidationError::new(format!("batch[{index}].{}", error.field), error.message)
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_common(
+    message_id: Option<&str>,
+    context: Option<&Value>,
+    integrations: Option<&Value>,
+    extra: &Map<String, Value>,
+    message_fields: &[&str],
+) -> std::result::Result<(), ValidationError> {
+    if let Some(message_id) = message_id {
+        validate_non_empty("messageId", message_id)?;
+        if message_id.chars().count() >= 100 {
+            return Err(ValidationError::new(
+                "messageId",
+                "must contain fewer than 100 characters",
+            ));
+        }
+    }
+    validate_optional_object("context", context)?;
+    validate_optional_object("integrations", integrations)?;
+
+    let mut reserved = vec![
+        "type",
+        "userId",
+        "anonymousId",
+        "messageId",
+        "timestamp",
+        "context",
+        "integrations",
+        "writeKey",
+    ];
+    reserved.extend_from_slice(message_fields);
+    validate_extra_fields(extra, &reserved)
+}
+
+fn validate_user(user: &User, require_user_id: bool) -> std::result::Result<(), ValidationError> {
+    match user {
+        User::UserId { user_id } => validate_non_empty("userId", user_id),
+        User::AnonymousId { .. } if require_user_id => Err(ValidationError::new(
+            "userId",
+            "is required for alias messages",
+        )),
+        User::AnonymousId { anonymous_id } => validate_non_empty("anonymousId", anonymous_id),
+        User::Both {
+            user_id,
+            anonymous_id,
+        } => {
+            validate_non_empty("userId", user_id)?;
+            validate_non_empty("anonymousId", anonymous_id)
+        }
+    }
+}
+
+fn validate_non_empty(field: &str, value: &str) -> std::result::Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        Err(ValidationError::new(field, "must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_object_or_null(field: &str, value: &Value) -> std::result::Result<(), ValidationError> {
+    if value.is_null() || value.is_object() {
+        Ok(())
+    } else {
+        Err(ValidationError::new(field, "must be a JSON object"))
+    }
+}
+
+fn validate_optional_object(
+    field: &str,
+    value: Option<&Value>,
+) -> std::result::Result<(), ValidationError> {
+    match value {
+        None | Some(Value::Object(_)) => Ok(()),
+        Some(_) => Err(ValidationError::new(field, "must be a JSON object")),
+    }
+}
+
+fn validate_extra_fields(
+    extra: &Map<String, Value>,
+    reserved: &[&str],
+) -> std::result::Result<(), ValidationError> {
+    if let Some(field) = reserved.iter().find(|field| extra.contains_key(**field)) {
+        Err(ValidationError::new(
+            "extra",
+            format!("must not override reserved field `{field}`"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_common(message_id: &mut Option<String>, context: &mut Option<Value>) {
+    message_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+
+    let library = json!({
+        "name": "segment-rust",
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    match context {
+        Some(Value::Object(context)) => {
+            context.insert("library".to_owned(), library);
+        }
+        None => {
+            *context = Some(json!({ "library": library }));
+        }
+        Some(_) => unreachable!("context was validated before preparation"),
     }
 }
 
@@ -391,10 +769,7 @@ mod tests {
                     "foo": "bar",
                     "baz": "quux",
                 }),
-                extra: [("messageId".to_owned(), json!("123"))]
-                    .iter()
-                    .cloned()
-                    .collect(),
+                message_id: Some("123".to_owned()),
                 ..Default::default()
             }))
             .unwrap(),
@@ -545,5 +920,148 @@ mod tests {
 
         let serialized = serde_json::to_value(track).expect("track should serialize");
         assert_eq!(serialized["timestamp"], "2024-01-01T05:00:00Z");
+    }
+
+    #[test]
+    fn validation_rejects_invalid_required_fields_and_shapes() {
+        let empty_identity = Track {
+            event: "Example".to_owned(),
+            properties: json!({}),
+            ..Default::default()
+        };
+        assert_eq!(
+            Message::from(empty_identity)
+                .validate()
+                .expect_err("empty identity should be rejected")
+                .field,
+            "anonymousId"
+        );
+
+        let invalid_properties = Track {
+            user: User::UserId {
+                user_id: "user".to_owned(),
+            },
+            event: "Example".to_owned(),
+            properties: json!(["not", "an", "object"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            Message::from(invalid_properties)
+                .validate()
+                .expect_err("array properties should be rejected")
+                .field,
+            "properties"
+        );
+
+        let alias = Alias {
+            user: User::AnonymousId {
+                anonymous_id: "anonymous".to_owned(),
+            },
+            previous_id: "previous".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            Message::from(alias)
+                .validate()
+                .expect_err("alias requires a user ID")
+                .field,
+            "userId"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_reserved_extra_fields() {
+        let track = Track {
+            user: User::UserId {
+                user_id: "user".to_owned(),
+            },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            extra: [("event".to_owned(), json!("Override"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let error = Message::from(track)
+            .validate()
+            .expect_err("reserved field collision should be rejected");
+        assert_eq!(error.field, "extra");
+    }
+
+    #[test]
+    fn preparation_adds_stable_id_and_library_context() {
+        let mut message = Message::from(Track {
+            user: User::UserId {
+                user_id: "user".to_owned(),
+            },
+            event: "Example".to_owned(),
+            properties: json!({}),
+            context: Some(json!({ "requestId": "request" })),
+            ..Default::default()
+        });
+
+        message.prepare().expect("valid message should prepare");
+        let Message::Track(track) = &message else {
+            panic!("expected track message");
+        };
+        let message_id = track.message_id.clone().expect("ID should be generated");
+        assert!(uuid::Uuid::parse_str(&message_id).is_ok());
+        assert_eq!(track.context.as_ref().unwrap()["requestId"], "request");
+        assert_eq!(
+            track.context.as_ref().unwrap()["library"]["name"],
+            "segment-rust"
+        );
+
+        message.prepare().expect("preparation should be idempotent");
+        let Message::Track(track) = message else {
+            panic!("expected track message");
+        };
+        assert_eq!(track.message_id.as_deref(), Some(message_id.as_str()));
+    }
+
+    #[test]
+    fn batch_preparation_adds_sent_at_and_nested_metadata() {
+        let mut message = Message::from(Batch {
+            batch: vec![BatchMessage::from(Track {
+                user: User::UserId {
+                    user_id: "user".to_owned(),
+                },
+                event: "Example".to_owned(),
+                properties: json!({}),
+                ..Default::default()
+            })],
+            ..Default::default()
+        });
+
+        message.prepare().expect("valid batch should prepare");
+        let Message::Batch(batch) = message else {
+            panic!("expected batch message");
+        };
+        assert!(batch.sent_at.is_some());
+        let BatchMessage::Track(track) = &batch.batch[0] else {
+            panic!("expected track message");
+        };
+        assert!(track.message_id.is_some());
+    }
+
+    #[test]
+    fn message_deserialization_uses_type_to_distinguish_page_and_screen() {
+        let screen: Message = serde_json::from_value(json!({
+            "type": "screen",
+            "anonymousId": "anonymous",
+            "name": "Home",
+            "properties": {}
+        }))
+        .expect("typed screen should deserialize");
+        assert!(matches!(screen, Message::Screen(_)));
+
+        let ambiguous = serde_json::from_value::<Message>(json!({
+            "anonymousId": "anonymous",
+            "name": "Home",
+            "properties": {}
+        }))
+        .expect_err("untyped page/screen payload should be rejected");
+        assert!(ambiguous.to_string().contains("ambiguous"));
     }
 }
