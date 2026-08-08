@@ -1,6 +1,8 @@
 //! Utilities for batching up messages.
 //! When a batch is full it is automatically sent over the network
 
+use std::collections::VecDeque;
+
 use serde_json::Map;
 
 use crate::{
@@ -16,7 +18,7 @@ use crate::{
 ///
 /// The recommended usage pattern looks something like this:
 ///
-/// ```
+/// ```no_run
 /// use segment::{AutoBatcher, Batcher, HttpClient};
 /// use segment::message::{Track, User};
 /// use serde_json::json;
@@ -54,6 +56,7 @@ use crate::{
 pub struct AutoBatcher<C = HttpClient> {
     client: C,
     batcher: Batcher,
+    pending: VecDeque<BatchMessage>,
     key: String,
 }
 
@@ -74,6 +77,7 @@ where
         Self {
             batcher,
             client,
+            pending: VecDeque::new(),
             key: key.into(),
         }
     }
@@ -84,7 +88,7 @@ where
     /// Returns an error if the message is too large to be sent to Segment's
     /// API.
     ///
-    /// ```
+    /// ```no_run
     /// use serde_json::json;
     /// use segment::{AutoBatcher, Batcher, HttpClient};
     /// use segment::message::{Track, User};
@@ -108,10 +112,19 @@ where
     /// }
     /// ```
     pub async fn push(&mut self, msg: impl Into<BatchMessage>) -> Result<()> {
+        let msg = msg.into();
+
+        if !self.pending.is_empty() {
+            self.pending.push_back(msg);
+            return self.flush().await;
+        }
+
         if let Some(msg) = self.batcher.push(msg)? {
-            self.flush().await?;
-            // this can't return None: the batcher is empty and if the message is
-            // larger than the max size of the batcher it's supposed to throw an error
+            if let Err(error) = self.flush_current_batch().await {
+                self.pending.push_back(msg);
+                return Err(error);
+            }
+
             self.batcher.push(msg)?;
         }
 
@@ -122,7 +135,7 @@ where
     ///
     /// Returns an error if the message is too large to be sent to Segment's
     /// API.
-    /// ```
+    /// ```no_run
     /// use serde_json::json;
     /// use segment::{AutoBatcher, Batcher, HttpClient};
     /// use segment::message::{Track, User};
@@ -146,25 +159,52 @@ where
     /// }
     /// ```
     pub async fn flush(&mut self) -> Result<()> {
+        self.flush_current_batch().await?;
+
+        while let Some(msg) = self.pending.pop_front() {
+            if let Some(msg) = self
+                .batcher
+                .push(msg)
+                .expect("pending messages were validated before being queued")
+            {
+                self.pending.push_front(msg);
+                self.flush_current_batch().await?;
+            }
+        }
+
+        self.flush_current_batch().await
+    }
+
+    async fn flush_current_batch(&mut self) -> Result<()> {
         if self.batcher.is_empty() {
             return Ok(());
         }
 
+        let buffered = self.batcher.take();
+
         let message = Message::Batch(Batch {
-            batch: self.batcher.take(),
+            batch: buffered.clone(),
             context: self.batcher.context.clone(),
             integrations: None,
             extra: Map::default(),
         });
 
-        self.client.send(&self.key, message).await?;
-        Ok(())
+        match self.client.send(&self.key, message).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.batcher.restore(buffered);
+                Err(error)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use serde_json::json;
 
@@ -218,5 +258,107 @@ mod tests {
             panic!("expected a batch message");
         };
         assert_eq!(batch.batch.len(), 1);
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailOnceClient {
+        failed: Arc<AtomicBool>,
+        sent: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl Client for FailOnceClient {
+        fn send<'a>(
+            &'a self,
+            _write_key: &'a str,
+            msg: Message,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            let result = if self.failed.swap(true, Ordering::SeqCst) {
+                self.sent
+                    .lock()
+                    .expect("recording client lock was poisoned")
+                    .push(msg);
+                Ok(())
+            } else {
+                Err(crate::Error::MessageTooLarge)
+            };
+            std::future::ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_flush_retains_messages_for_a_retry() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = FailOnceClient {
+            failed: Arc::new(AtomicBool::new(false)),
+            sent: Arc::clone(&sent),
+        };
+        let mut batcher = AutoBatcher::new(client, Batcher::new(None), "write-key");
+
+        batcher
+            .push(Track {
+                user: User::UserId {
+                    user_id: "user".to_owned(),
+                },
+                event: "Example".to_owned(),
+                properties: json!({}),
+                ..Default::default()
+            })
+            .await
+            .expect("message should be queued");
+
+        batcher
+            .flush()
+            .await
+            .expect_err("the first delivery should fail");
+        assert_eq!(batcher.batcher.buf.len(), 1);
+
+        batcher.flush().await.expect("the retry should succeed");
+        assert!(batcher.batcher.is_empty());
+        assert_eq!(sent.lock().expect("lock should not be poisoned").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_rollover_retains_the_overflowing_message() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = FailOnceClient {
+            failed: Arc::new(AtomicBool::new(false)),
+            sent: Arc::clone(&sent),
+        };
+        let mut batcher = AutoBatcher::new(client, Batcher::new(None), "write-key");
+
+        let message = Track {
+            user: User::UserId {
+                user_id: "user".to_owned(),
+            },
+            event: "Example".to_owned(),
+            properties: json!({ "padding": "a".repeat(30_000) }),
+            ..Default::default()
+        };
+
+        let mut accepted = 0;
+        loop {
+            match batcher.push(message.clone()).await {
+                Ok(()) => accepted += 1,
+                Err(crate::Error::MessageTooLarge) => break,
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+
+        assert_eq!(batcher.pending.len(), 1);
+        assert!(!batcher.batcher.is_empty());
+
+        batcher
+            .flush()
+            .await
+            .expect("retry should deliver everything");
+        let sent = sent.lock().expect("lock should not be poisoned");
+        let delivered = sent
+            .iter()
+            .map(|message| match message {
+                Message::Batch(batch) => batch.batch.len(),
+                _ => panic!("expected batch message"),
+            })
+            .sum::<usize>();
+        assert_eq!(delivered, accepted + 1);
     }
 }

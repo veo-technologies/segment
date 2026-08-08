@@ -20,7 +20,7 @@ segment = { version = "0.3", default-features = false, features = ["native-tls"]
 
 ## Example usage(s)
 
-```rust
+```rust,no_run
 use segment::{HttpClient, Client, AutoBatcher, Batcher};
 use segment::message::{Track, User};
 use serde_json::json;
@@ -58,7 +58,7 @@ async fn main() -> segment::Result<()> {
 
 or when you want to do struct to struct transformations
 
-```rust
+```rust,no_run
 use segment::{HttpClient, Client};
 use segment::message::{Track, Message, User};
 use serde_json::json;

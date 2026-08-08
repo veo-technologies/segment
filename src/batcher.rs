@@ -6,14 +6,15 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 32;
-const MAX_BATCH_SIZE: usize = 1024 * 500;
+const MAX_BATCH_SIZE: usize = 500_000;
+const MAX_BATCH_MESSAGES: usize = 2_500;
 
 /// A batcher can accept messages into an internal buffer, and report when
 /// messages must be flushed.
 ///
 /// The recommended usage pattern looks something like this:
 ///
-/// ```
+/// ```no_run
 /// use segment::{Batcher, Client, HttpClient};
 /// use segment::message::{Track, User};
 /// use serde_json::json;
@@ -67,7 +68,9 @@ const MAX_BATCH_SIZE: usize = 1024 * 500;
 #[derive(Clone, Debug)]
 pub struct Batcher {
     pub(crate) buf: Vec<BatchMessage>,
+    /// Exact serialized size of the batch envelope and its buffered messages.
     pub(crate) byte_count: usize,
+    pub(crate) empty_batch_size: usize,
     pub(crate) context: Option<Value>,
     pub(crate) auto_timestamp: bool,
 }
@@ -78,9 +81,11 @@ impl Batcher {
     /// Optionally, you may specify a `context` that should be set on every
     /// batch returned by `into_message`.
     pub fn new(context: Option<Value>) -> Self {
+        let empty_batch_size = serialized_batch_size(&[], context.as_ref());
         Self {
             buf: Vec::new(),
-            byte_count: 0,
+            byte_count: empty_batch_size,
+            empty_batch_size,
             context,
             auto_timestamp: true,
         }
@@ -117,8 +122,12 @@ impl Batcher {
             return Err(Error::MessageTooLarge);
         }
 
-        let byte_count = self.byte_count + size + 1; // +1 to account for serialized data's extra commas
-        if byte_count > MAX_BATCH_SIZE {
+        let separator_size = usize::from(!self.buf.is_empty());
+        let byte_count = self.byte_count + separator_size + size;
+        if self.buf.len() == MAX_BATCH_MESSAGES || byte_count > MAX_BATCH_SIZE {
+            if self.buf.is_empty() {
+                return Err(Error::BatchTooLarge);
+            }
             return Ok(Some(msg));
         }
 
@@ -128,8 +137,13 @@ impl Batcher {
     }
 
     pub(crate) fn take(&mut self) -> Vec<BatchMessage> {
-        self.byte_count = 0;
+        self.byte_count = self.empty_batch_size;
         std::mem::take(&mut self.buf)
+    }
+
+    pub(crate) fn restore(&mut self, messages: Vec<BatchMessage>) {
+        self.byte_count = serialized_batch_size(&messages, self.context.as_ref());
+        self.buf = messages;
     }
 
     /// Consumes this batcher and converts it into a message that can be sent to
@@ -142,6 +156,17 @@ impl Batcher {
             extra: Map::default(),
         })
     }
+}
+
+fn serialized_batch_size(messages: &[BatchMessage], context: Option<&Value>) -> usize {
+    serde_json::to_vec(&Batch {
+        batch: messages.to_vec(),
+        context: context.cloned(),
+        integrations: None,
+        extra: Map::default(),
+    })
+    .expect("Segment messages backed by serde_json::Value must serialize")
+    .len()
 }
 
 #[cfg(test)]
@@ -259,5 +284,63 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn byte_count_includes_the_complete_batch_envelope() {
+        let context = json!({ "source": "batch-test" });
+        let mut batcher = Batcher::new(Some(context));
+        batcher.without_auto_timestamp();
+        batcher
+            .push(Track {
+                user: User::UserId {
+                    user_id: "user".to_owned(),
+                },
+                event: "Example".to_owned(),
+                properties: json!({ "key": "value" }),
+                ..Default::default()
+            })
+            .expect("message should fit");
+
+        let actual_size = serde_json::to_vec(&batcher.clone().into_message())
+            .expect("batch should serialize")
+            .len();
+        assert_eq!(batcher.byte_count, actual_size);
+    }
+
+    #[test]
+    fn oversized_batch_context_rejects_the_first_message() {
+        let context = json!({ "padding": "a".repeat(MAX_BATCH_SIZE) });
+        let mut batcher = Batcher::new(Some(context));
+
+        let error = batcher
+            .push(Track::default())
+            .expect_err("an oversized envelope can never be flushed successfully");
+
+        assert!(matches!(error, Error::BatchTooLarge));
+        assert!(batcher.is_empty());
+    }
+
+    #[test]
+    fn batch_message_count_is_limited() {
+        let mut batcher = Batcher::new(None);
+        batcher.without_auto_timestamp();
+
+        for _ in 0..MAX_BATCH_MESSAGES {
+            assert_eq!(
+                batcher
+                    .push(Track::default())
+                    .expect("small message should be valid"),
+                None
+            );
+        }
+
+        assert!(
+            batcher
+                .push(Track::default())
+                .expect("small message should be valid")
+                .is_some()
+        );
+        assert_eq!(batcher.buf.len(), MAX_BATCH_MESSAGES);
     }
 }
