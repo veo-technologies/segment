@@ -10,6 +10,10 @@ version = "0.3.1"
 readme = "README.md"
 rust-version = "1.85"
 
+[workspace]
+members = ["segment-public-api"]
+resolver = "3"
+
 [dependencies]
 jiff = { version = "0.2.35", default-features = false, features = ["serde", "std"] }
 reqwest = { version = "0.13.4", features = ["json"], default-features = false }

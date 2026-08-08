@@ -54,6 +54,10 @@ enrichment and filtering. `analytics.subscribe()` returns a non-blocking
 broadcast stream of enqueue, delivery, failure, queue-pressure, and shutdown
 events for metrics and logging.
 
+Workspace configuration belongs to the separate `segment-public-api` workspace
+crate. Its complete typed client is generated from Segment's official OpenAPI
+document and uses Public API bearer tokens rather than Tracking API write keys.
+
 The lower-level batching APIs remain available when the application owns its
 delivery loop:
 
