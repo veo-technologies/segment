@@ -2,8 +2,8 @@
 
 use crate::message::{Batch, BatchMessage, Message};
 use crate::{Error, Result};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
-use time::OffsetDateTime;
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 32;
 const MAX_BATCH_SIZE: usize = 1024 * 500;
@@ -110,7 +110,7 @@ impl Batcher {
         let mut msg: BatchMessage = msg.into();
         let timestamp = msg.timestamp_mut();
         if self.auto_timestamp && timestamp.is_none() {
-            *timestamp = Some(OffsetDateTime::now_utc());
+            *timestamp = Some(Timestamp::now());
         }
         let size = serde_json::to_vec(&msg)?.len();
         if size > MAX_MESSAGE_SIZE {
@@ -174,6 +174,19 @@ mod tests {
         assert_eq!(1, inner_batch.batch.len());
 
         assert_eq!(inner_batch.batch, vec![batch_msg]);
+    }
+
+    #[test]
+    fn test_push_adds_timestamp() {
+        let mut batcher = Batcher::new(None);
+        batcher
+            .push(Track::default())
+            .expect("message should be accepted");
+
+        let BatchMessage::Track(track) = &batcher.buf[0] else {
+            panic!("pushed message should be a track event");
+        };
+        assert!(track.timestamp.is_some());
     }
 
     #[test]

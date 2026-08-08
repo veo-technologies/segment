@@ -28,9 +28,9 @@
 
 use std::fmt::Display;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use time::OffsetDateTime;
 
 /// An enum containing all values which may be sent to Segment's tracking API.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +59,8 @@ pub struct Identify {
     pub traits: Value,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,11 +92,8 @@ pub struct Track {
     pub properties: Value,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,11 +125,8 @@ pub struct Page {
     pub properties: Value,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,11 +158,8 @@ pub struct Screen {
     pub properties: Value,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,11 +192,8 @@ pub struct Group {
     pub traits: Value,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,11 +223,8 @@ pub struct Alias {
     pub previous_id: String,
 
     /// The timestamp associated with this message.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub timestamp: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<Timestamp>,
 
     /// Context associated with this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,7 +281,7 @@ pub enum BatchMessage {
 }
 
 impl BatchMessage {
-    pub(crate) fn timestamp_mut(&mut self) -> &mut Option<OffsetDateTime> {
+    pub(crate) fn timestamp_mut(&mut self) -> &mut Option<Timestamp> {
         match self {
             Self::Identify(identify) => &mut identify.timestamp,
             Self::Track(track) => &mut track.timestamp,
@@ -535,7 +517,33 @@ mod tests {
             }))
             .unwrap(),
             r#"{"batch":[{"type":"track","userId":"foo","event":"Foo","properties":{}},{"type":"track","userId":"bar","event":"Bar","properties":{}},{"type":"track","userId":"baz","event":"Baz","properties":{}}],"context":{"foo":"bar"}}"#
-                .to_owned(),
+            .to_owned(),
         );
+    }
+
+    #[test]
+    fn deserialize_without_timestamp() {
+        let track: Track = serde_json::from_value(json!({
+            "anonymousId": "foo",
+            "event": "Foo",
+            "properties": {}
+        }))
+        .expect("timestamp should be optional");
+
+        assert_eq!(track.timestamp, None);
+    }
+
+    #[test]
+    fn timestamp_serializes_as_utc() {
+        let track: Track = serde_json::from_value(json!({
+            "anonymousId": "foo",
+            "event": "Foo",
+            "properties": {},
+            "timestamp": "2024-01-01T00:00:00-05:00"
+        }))
+        .expect("timestamp with an offset should deserialize");
+
+        let serialized = serde_json::to_value(track).expect("track should serialize");
+        assert_eq!(serialized["timestamp"], "2024-01-01T05:00:00Z");
     }
 }
