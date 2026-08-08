@@ -29,7 +29,7 @@
 use std::fmt::Display;
 
 use jiff::Timestamp;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::{Map, Value, json};
 
 use crate::{Result, ValidationError};
@@ -386,7 +386,11 @@ pub struct Batch {
     pub batch: Vec<BatchMessage>,
 
     /// Time at which this batch was sent to Segment.
-    #[serde(rename = "sentAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "sentAt",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_sent_at"
+    )]
     pub sent_at: Option<Timestamp>,
 
     /// Context associated with this message.
@@ -400,6 +404,33 @@ pub struct Batch {
     /// Extra fields to put at the top level of this message.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn serialize_sent_at<S>(
+    timestamp: &Option<Timestamp>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match timestamp {
+        Some(timestamp) => serializer.serialize_some(&fixed_precision_timestamp(timestamp)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn fixed_precision_timestamp(timestamp: &Timestamp) -> String {
+    let value = timestamp.to_string();
+    let without_zone = value
+        .strip_suffix('Z')
+        .expect("jiff timestamps are formatted in UTC");
+    let (seconds, fraction) = without_zone.split_once('.').unwrap_or((without_zone, ""));
+    let mut fraction = fraction.to_owned();
+    fraction.truncate(9);
+    while fraction.len() < 9 {
+        fraction.push('0');
+    }
+    format!("{seconds}.{fraction}Z")
 }
 
 /// An enum containing all messages which may be placed inside a batch.
