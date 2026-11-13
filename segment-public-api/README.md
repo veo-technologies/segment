@@ -5,7 +5,7 @@ management-plane Public API. It is intentionally separate from the `segment`
 crate, which sends events to the Tracking API with a source write key.
 
 The complete client surface is generated from Segment Public API OpenAPI
-`73.1.0`, including Sources, Destinations, Warehouses, Tracking Plans, Catalog,
+`74.0.1`, including Sources, Destinations, Warehouses, Tracking Plans, Catalog,
 IAM, Audiences, Functions, and usage APIs.
 
 ```rust,no_run

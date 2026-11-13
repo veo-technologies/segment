@@ -1,11 +1,11 @@
 # OpenAPI source
 
-`segment-public-api-73.1.0.json` is the OpenAPI document embedded in Segment's
-official [Public API reference](https://docs.segmentapis.com/) on 2026-08-08.
+`segment-public-api-74.0.1.json` is the OpenAPI document embedded in Segment's
+official [Public API reference](https://docs.segmentapis.com/) on 2026-11-13.
 
-- Public API version: `73.1.0`
+- Public API version: `74.0.1`
 - Upstream document SHA-256:
-  `b7f0228e5ffd642ca0578c26b5d117d3025fa11c4018f8e062736709169cecbc`
+  `e4a695614df0122aaa28e1ce02b624975c17f4c39ba0e44099ca6a92a3447b03`
 
 The checked-in document remains byte-for-byte identical to that upstream JSON.
 At build time, `build.rs` maps Segment's versioned JSON media types to the

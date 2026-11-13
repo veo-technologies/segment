@@ -2,13 +2,12 @@
 
 use std::{fmt, sync::Arc, time::Duration};
 
-use jiff::Timestamp;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::{
     AutoBatcher, Batcher, Client, Error, HttpClient, Result, ValidationError,
-    batcher::{MAX_BATCH_SIZE, MAX_MESSAGE_SIZE},
+    batcher::{MAX_BATCH_SIZE, PreparedBatchMessage},
     message::{Alias, BatchMessage, Group, Identify, Page, Screen, Track},
 };
 
@@ -66,6 +65,8 @@ pub enum AnalyticsEvent {
     DeliveryFailed {
         message_count: usize,
         reason: FlushReason,
+        status: Option<reqwest::StatusCode>,
+        retryable: bool,
         error: String,
     },
     /// A message was rejected by the configured queue overflow policy.
@@ -316,22 +317,16 @@ impl Analytics {
                 }
             };
         }
-        if self.inner.auto_timestamp && message.timestamp_mut().is_none() {
-            *message.timestamp_mut() = Some(Timestamp::now());
-        }
-        message.prepare()?;
-        let message_size = serde_json::to_vec(&message)?.len();
-        if message_size > MAX_MESSAGE_SIZE {
-            return Err(Error::MessageTooLarge);
-        }
-        if self.inner.empty_batch_size + message_size > MAX_BATCH_SIZE {
+        let prepared = PreparedBatchMessage::new(message, self.inner.auto_timestamp)?;
+        if self.inner.empty_batch_size + prepared.serialized_size > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
         }
-        let message_id = message
+        let message_id = prepared
+            .message
             .message_id()
             .expect("message preparation generates an ID")
             .to_owned();
-        let message_type = message.message_type();
+        let message_type = prepared.message.message_type();
 
         let state = self.inner.state.lock().await;
         if *state != State::Open {
@@ -342,16 +337,18 @@ impl Analytics {
             OverflowPolicy::Block => self
                 .inner
                 .sender
-                .send(Command::Event(Box::new(message)))
+                .send(Command::Event(Box::new(prepared)))
                 .await
                 .map_err(|_| Error::WorkerStopped),
             OverflowPolicy::Reject => match self
                 .inner
                 .sender
-                .try_send(Command::Event(Box::new(message)))
+                .try_send(Command::Event(Box::new(prepared)))
             {
                 Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(message_type, "analytics queue full, rejecting message");
                     publish(
                         &self.inner.events,
                         AnalyticsEvent::QueueFull { message_type },
@@ -509,7 +506,7 @@ enum State {
 }
 
 enum Command {
-    Event(Box<BatchMessage>),
+    Event(Box<PreparedBatchMessage>),
     Flush {
         sender: oneshot::Sender<Result<()>>,
         reason: FlushReason,
@@ -533,9 +530,9 @@ async fn run_worker<C>(
     loop {
         tokio::select! {
             command = receiver.recv() => match command {
-                Some(Command::Event(message)) => {
+                Some(Command::Event(prepared)) => {
                     accepted_since_flush += 1;
-                    let result = push_observed(&mut batcher, *message, &events).await;
+                    let result = push_observed(&mut batcher, *prepared, &events).await;
                     if result.is_ok()
                         && accepted_since_flush >= flush_at
                         && flush_observed(&mut batcher, FlushReason::MessageCount, &events).await.is_ok()
@@ -571,21 +568,28 @@ async fn run_worker<C>(
 
 async fn push_observed<C>(
     batcher: &mut AutoBatcher<C>,
-    message: BatchMessage,
+    prepared: PreparedBatchMessage,
     events: &broadcast::Sender<AnalyticsEvent>,
 ) -> Result<()>
 where
     C: Client,
 {
     let before = batcher.len();
-    match batcher.push(message).await {
+    match batcher.push_prepared(prepared).await {
         Ok(()) => {
             let after = batcher.len();
             if after < before + 1 {
+                let message_count = before + 1 - after;
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    message_count,
+                    reason = ?FlushReason::Capacity,
+                    "delivered segment batch"
+                );
                 publish(
                     events,
                     AnalyticsEvent::Delivered {
-                        message_count: before + 1 - after,
+                        message_count,
                         reason: FlushReason::Capacity,
                     },
                 );
@@ -593,11 +597,24 @@ where
             Ok(())
         }
         Err(error) => {
+            let message_count = batcher.len();
+            let (status, retryable) = error.retry_metadata();
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                message_count,
+                reason = ?FlushReason::Capacity,
+                ?status,
+                retryable,
+                %error,
+                "segment batch delivery failed"
+            );
             publish(
                 events,
                 AnalyticsEvent::DeliveryFailed {
-                    message_count: batcher.len(),
+                    message_count,
                     reason: FlushReason::Capacity,
+                    status,
+                    retryable,
                     error: error.to_string(),
                 },
             );
@@ -621,6 +638,8 @@ where
 
     match batcher.flush().await {
         Ok(()) => {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(message_count, ?reason, "delivered segment batch");
             publish(
                 events,
                 AnalyticsEvent::Delivered {
@@ -631,11 +650,24 @@ where
             Ok(())
         }
         Err(error) => {
+            let message_count = batcher.len();
+            let (status, retryable) = error.retry_metadata();
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                message_count,
+                ?reason,
+                ?status,
+                retryable,
+                %error,
+                "segment batch delivery failed"
+            );
             publish(
                 events,
                 AnalyticsEvent::DeliveryFailed {
-                    message_count: batcher.len(),
+                    message_count,
                     reason,
+                    status,
+                    retryable,
                     error: error.to_string(),
                 },
             );
@@ -671,12 +703,12 @@ mod tests {
         fn send<'a>(
             &'a self,
             _write_key: &'a str,
-            message: Message,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            message: &'a Message,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
             self.sent
                 .lock()
                 .expect("recording client lock was poisoned")
-                .push(message);
+                .push(message.clone());
             self.delivered.notify_one();
             std::future::ready(Ok(()))
         }
@@ -700,8 +732,8 @@ mod tests {
         fn send<'a>(
             &'a self,
             _write_key: &'a str,
-            message: Message,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            message: &'a Message,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
             if !self.failed.swap(true, Ordering::SeqCst) {
                 return std::future::ready(Err(Error::Middleware(
                     "simulated delivery failure".to_owned(),
@@ -710,17 +742,17 @@ mod tests {
             self.sent
                 .lock()
                 .expect("recording client lock was poisoned")
-                .push(message);
+                .push(message.clone());
             std::future::ready(Ok(()))
         }
     }
 
     impl Client for BlockingOnceClient {
-        async fn send<'a>(&'a self, _write_key: &'a str, message: Message) -> Result<()> {
+        async fn send<'a>(&'a self, _write_key: &'a str, message: &'a Message) -> Result<()> {
             self.sent
                 .lock()
                 .expect("recording client lock was poisoned")
-                .push(message);
+                .push(message.clone());
             if !self.blocked.swap(true, Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -1036,6 +1068,70 @@ mod tests {
             AnalyticsEvent::Delivered {
                 message_count: 1,
                 reason: FlushReason::Manual
+            }
+        )));
+    }
+
+    #[derive(Clone, Debug)]
+    struct RateLimitedOnceClient {
+        sent: Arc<StdMutex<Vec<Message>>>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl Client for RateLimitedOnceClient {
+        fn send<'a>(
+            &'a self,
+            _write_key: &'a str,
+            message: &'a Message,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                return std::future::ready(Err(Error::from(crate::errors::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body: "rate limited".to_owned(),
+                    headers: reqwest::header::HeaderMap::new(),
+                })));
+            }
+            self.sent
+                .lock()
+                .expect("recording client lock was poisoned")
+                .push(message.clone());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_failed_captures_api_error_status_and_retryability() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let client = RateLimitedOnceClient {
+            sent: Arc::clone(&sent),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let analytics = Analytics::builder_with_client("write-key", client)
+            .flush_at(100)
+            .flush_interval(Duration::from_secs(60))
+            .build()
+            .expect("client should build");
+        let mut events = analytics.subscribe();
+
+        analytics
+            .track(track("RateLimited"))
+            .await
+            .expect("event should queue");
+        assert!(matches!(analytics.flush().await, Err(Error::ApiError(_))));
+        analytics
+            .close_and_flush()
+            .await
+            .expect("close should succeed");
+
+        let events = received_events(&mut events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnalyticsEvent::DeliveryFailed {
+                message_count: 1,
+                reason: FlushReason::Manual,
+                status: Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+                retryable: true,
+                ..
             }
         )));
     }

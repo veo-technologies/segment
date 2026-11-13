@@ -16,12 +16,10 @@ async fn main() -> segment::Result<()> {
     // source.
     for i in 0..10 {
         let msg = Track {
-            user: User::UserId {
-                user_id: format!("user-{}", i),
-            },
+            user: User::user_id(format!("user-{i}")),
             event: "Batched Event".to_owned(),
             properties: json!({
-                "foo": format!("bar-{}", i),
+                "foo": format!("bar-{i}"),
             }),
             ..Default::default()
         };
@@ -30,7 +28,7 @@ async fn main() -> segment::Result<()> {
         // would probably want to put this message in a deadletter queue or some
         // equivalent.
         if let Some(msg) = batcher.push(msg)? {
-            client.send(write_key, batcher.into_message()).await?;
+            client.send(write_key, &batcher.into_message()).await?;
 
             batcher = Batcher::new(None);
             batcher.push(msg)?; // Same error condition as above.
@@ -38,7 +36,7 @@ async fn main() -> segment::Result<()> {
     }
 
     if !batcher.is_empty() {
-        client.send(write_key, batcher.into_message()).await?;
+        client.send(write_key, &batcher.into_message()).await?;
     }
 
     Ok(())

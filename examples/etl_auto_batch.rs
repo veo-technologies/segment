@@ -17,12 +17,10 @@ async fn main() -> segment::Result<()> {
     // source.
     for i in 0..10 {
         let msg = Track {
-            user: User::UserId {
-                user_id: format!("user-{}", i),
-            },
+            user: User::user_id(format!("user-{i}")),
             event: "Auto batched Event".to_owned(),
             properties: json!({
-                "foo": format!("bar-{}", i),
+                "foo": format!("bar-{i}"),
             }),
             ..Default::default()
         };

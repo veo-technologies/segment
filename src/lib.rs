@@ -15,5 +15,5 @@ pub use auto_batcher::AutoBatcher;
 pub use batcher::Batcher;
 pub use client::Client;
 pub use errors::{ApiError, Error, Result, ValidationError};
-pub use http::{HttpClient, RetryPolicy};
+pub use http::{DEFAULT_HOST, EU1_HOST, HttpClient, HttpClientBuilder, RetryPolicy};
 pub use message::Message;

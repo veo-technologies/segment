@@ -1,12 +1,13 @@
 //! Utilities for batching up messages.
 //! When a batch is full it is automatically sent over the network
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt};
 
 use serde_json::Map;
 
 use crate::{
-    batcher::Batcher,
+    Error, ValidationError,
+    batcher::{Batcher, MAX_BATCH_SIZE, PreparedBatchMessage},
     client::Client,
     errors::Result,
     http::HttpClient,
@@ -52,12 +53,23 @@ use crate::{
 ///
 /// If this delay is a concern, it is recommended that you periodically flush
 /// the batcher on your own by calling [Self::flush].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AutoBatcher<C = HttpClient> {
     client: C,
     batcher: Batcher,
-    pending: VecDeque<BatchMessage>,
+    pending: VecDeque<PreparedBatchMessage>,
     key: String,
+}
+
+impl<C: fmt::Debug> fmt::Debug for AutoBatcher<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutoBatcher")
+            .field("client", &self.client)
+            .field("batcher", &self.batcher)
+            .field("pending_len", &self.pending.len())
+            .field("key", &"[redacted]")
+            .finish()
+    }
 }
 
 impl<C> AutoBatcher<C>
@@ -116,20 +128,35 @@ where
     /// }
     /// ```
     pub async fn push(&mut self, msg: impl Into<BatchMessage>) -> Result<()> {
-        let msg = msg.into();
+        if self
+            .batcher
+            .context
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(ValidationError::new("context", "must be a JSON object").into());
+        }
 
+        let prepared = PreparedBatchMessage::new(msg.into(), self.batcher.auto_timestamp)?;
+        self.push_prepared(prepared).await
+    }
+
+    pub(crate) async fn push_prepared(&mut self, prepared: PreparedBatchMessage) -> Result<()> {
         if !self.pending.is_empty() {
-            self.pending.push_back(msg);
+            if self.batcher.empty_batch_size + prepared.serialized_size > MAX_BATCH_SIZE {
+                return Err(Error::BatchTooLarge);
+            }
+            self.pending.push_back(prepared);
             return self.flush().await;
         }
 
-        if let Some(msg) = self.batcher.push(msg)? {
+        if let Some(prepared) = self.batcher.push_prepared(prepared)? {
             if let Err(error) = self.flush_current_batch().await {
-                self.pending.push_back(msg);
+                self.pending.push_back(prepared);
                 return Err(error);
             }
 
-            self.batcher.push(msg)?;
+            self.batcher.push_prepared(prepared)?;
         }
 
         Ok(())
@@ -165,13 +192,13 @@ where
     pub async fn flush(&mut self) -> Result<()> {
         self.flush_current_batch().await?;
 
-        while let Some(msg) = self.pending.pop_front() {
-            if let Some(msg) = self
+        while let Some(prepared) = self.pending.pop_front() {
+            if let Some(prepared) = self
                 .batcher
-                .push(msg)
+                .push_prepared(prepared)
                 .expect("pending messages were validated before being queued")
             {
-                self.pending.push_front(msg);
+                self.pending.push_front(prepared);
                 self.flush_current_batch().await?;
             }
         }
@@ -184,20 +211,22 @@ where
             return Ok(());
         }
 
-        let buffered = self.batcher.take();
+        let (buffered, byte_count) = self.batcher.take_with_size();
 
         let message = Message::Batch(Batch {
-            batch: buffered.clone(),
+            batch: buffered,
             sent_at: Some(jiff::Timestamp::now()),
             context: self.batcher.context.clone(),
             integrations: None,
             extra: Map::default(),
         });
 
-        match self.client.send(&self.key, message).await {
+        match self.client.send(&self.key, &message).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.batcher.restore(buffered);
+                if let Message::Batch(batch) = message {
+                    self.batcher.restore_with_size(batch.batch, byte_count);
+                }
                 Err(error)
             }
         }
@@ -225,12 +254,12 @@ mod tests {
         fn send<'a>(
             &'a self,
             write_key: &'a str,
-            msg: Message,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            msg: &'a Message,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
             self.sent
                 .lock()
                 .expect("recording client lock was poisoned")
-                .push((write_key.to_owned(), msg));
+                .push((write_key.to_owned(), msg.clone()));
             std::future::ready(Ok(()))
         }
     }
@@ -275,13 +304,13 @@ mod tests {
         fn send<'a>(
             &'a self,
             _write_key: &'a str,
-            msg: Message,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            msg: &'a Message,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
             let result = if self.failed.swap(true, Ordering::SeqCst) {
                 self.sent
                     .lock()
                     .expect("recording client lock was poisoned")
-                    .push(msg);
+                    .push(msg.clone());
                 Ok(())
             } else {
                 Err(crate::Error::MessageTooLarge)
@@ -365,5 +394,16 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(delivered, accepted + 1);
+    }
+
+    #[test]
+    fn debug_redacts_write_key() {
+        let client = RecordingClient {
+            sent: Arc::new(Mutex::new(Vec::new())),
+        };
+        let batcher = AutoBatcher::new(client, Batcher::new(None), "secret-write-key");
+        let debug = format!("{batcher:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("secret-write-key"));
     }
 }

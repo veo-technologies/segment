@@ -14,6 +14,6 @@ pub trait Client {
     fn send<'a>(
         &'a self,
         write_key: &'a str,
-        msg: Message,
+        msg: &'a Message,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 }

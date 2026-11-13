@@ -3,7 +3,7 @@ use std::{env, fs, path::PathBuf};
 use progenitor::{GenerationSettings, Generator, InterfaceStyle, TagStyle};
 use serde_json::Value;
 
-const SPEC_PATH: &str = "openapi/segment-public-api-73.1.0.json";
+const SPEC_PATH: &str = "openapi/segment-public-api-74.0.1.json";
 
 fn main() {
     println!("cargo:rerun-if-changed={SPEC_PATH}");
@@ -33,14 +33,24 @@ fn main() {
     fs::write(output, generated).expect("could not write generated Segment Public API client");
 }
 
-// `PersonalizationInput.profile` and the top-level `Profile` component both
-// normalize to the Rust name `Profile`. Preserve both shapes under distinct,
-// descriptive generated names.
+// `PersonalizationInput.profile`, `PersonalizationOutput.profile`, and the
+// top-level `Profile` component all normalize to the Rust name `Profile`.
+// Preserve distinct shapes under descriptive generated names.
 fn disambiguate_inline_schema_titles(value: &mut Value) {
-    let title = value
-        .pointer_mut("/components/schemas/PersonalizationInput/properties/profile/title")
-        .expect("Segment 73.1.0 PersonalizationInput.profile schema changed");
-    *title = Value::String("PersonalizationProfile".to_owned());
+    for (pointer, replacement) in [
+        (
+            "/components/schemas/PersonalizationInput/properties/profile/title",
+            "PersonalizationInputProfile",
+        ),
+        (
+            "/components/schemas/PersonalizationOutput/properties/profile/title",
+            "PersonalizationOutputProfile",
+        ),
+    ] {
+        if let Some(title) = value.pointer_mut(pointer) {
+            *title = Value::String(replacement.to_owned());
+        }
+    }
 }
 
 // Redoc descriptions contain presentation indentation that rustdoc interprets
@@ -98,21 +108,21 @@ fn normalize_vendor_json_content_types(value: &mut Value) {
             }
         }
         Value::Object(object) => {
-            if let Some(Value::Object(content)) = object.get_mut("content") {
-                if !content.is_empty() && content.keys().all(|key| key.starts_with("application/"))
-                {
-                    let selected = [
-                        "application/vnd.segment.v1+json",
-                        "application/json",
-                        "application/vnd.segment.v1beta+json",
-                        "application/vnd.segment.v1alpha+json",
-                    ]
-                    .into_iter()
-                    .find_map(|key| content.get(key).cloned());
-                    if let Some(selected) = selected {
-                        content.clear();
-                        content.insert("application/json".to_owned(), selected);
-                    }
+            if let Some(Value::Object(content)) = object.get_mut("content")
+                && !content.is_empty()
+                && content.keys().all(|key| key.starts_with("application/"))
+            {
+                let selected = [
+                    "application/vnd.segment.v1+json",
+                    "application/json",
+                    "application/vnd.segment.v1beta+json",
+                    "application/vnd.segment.v1alpha+json",
+                ]
+                .into_iter()
+                .find_map(|key| content.get(key).cloned());
+                if let Some(selected) = selected {
+                    content.clear();
+                    content.insert("application/json".to_owned(), selected);
                 }
             }
             for value in object.values_mut() {

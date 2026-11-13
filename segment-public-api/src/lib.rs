@@ -5,10 +5,13 @@ use std::{fmt, time::Duration};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 /// Version of Segment's OpenAPI document used to generate this crate.
-pub const OPENAPI_VERSION: &str = "73.1.0";
+pub const OPENAPI_VERSION: &str = "74.0.1";
 
 /// Default US Public API endpoint.
 pub const DEFAULT_BASE_URL: &str = "https://api.segmentapis.com";
+
+/// EU Public API endpoint.
+pub const EU_BASE_URL: &str = "https://eu1.api.segmentapis.com";
 
 mod generated {
     #![allow(rustdoc::bare_urls)]
@@ -68,6 +71,12 @@ impl AuthenticatedClientBuilder {
         self
     }
 
+    /// Target Segment's EU Public API endpoint.
+    pub fn eu1(mut self) -> Self {
+        self.base_url = EU_BASE_URL.to_owned();
+        self
+    }
+
     /// Set the timeout for a complete API request.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
@@ -87,7 +96,8 @@ impl AuthenticatedClientBuilder {
             return Err(ConfigurationError::EmptyToken);
         }
 
-        reqwest::Url::parse(&self.base_url)
+        let base_url = self.base_url.trim_end_matches('/');
+        reqwest::Url::parse(base_url)
             .map_err(|error| ConfigurationError::InvalidBaseUrl(error.to_string()))?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(ConfigurationError::InvalidToken)?;
@@ -106,7 +116,7 @@ impl AuthenticatedClientBuilder {
             .build()
             .map_err(ConfigurationError::HttpClient)?;
 
-        Ok(Client::new_with_client(&self.base_url, http))
+        Ok(Client::new_with_client(base_url, http))
     }
 }
 
@@ -159,6 +169,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn authentication_builder_supports_eu1_and_strips_trailing_slash() {
+        let eu_builder = Client::authenticated_builder("token").eu1();
+        assert_eq!(eu_builder.base_url, EU_BASE_URL);
+        assert!(eu_builder.build().is_ok());
+
+        let client = Client::authenticated_builder("token")
+            .base_url("https://eu1.api.segmentapis.com/")
+            .build()
+            .expect("trailing slash should be normalized");
+        assert_eq!(client.baseurl(), EU_BASE_URL);
+    }
+
     #[tokio::test]
     async fn generated_request_uses_bearer_auth_and_api_version() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -174,7 +197,7 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..bytes]).to_ascii_lowercase();
             assert!(request.starts_with("get / http/1.1\r\n"));
             assert!(request.contains("authorization: bearer test-token\r\n"));
-            assert!(request.contains("api-version: 73.1.0\r\n"));
+            assert!(request.contains("api-version: 74.0.1\r\n"));
 
             let body =
                 r#"{"data":{"workspace":{"id":"workspace-id","name":"Test","slug":"test"}}}"#;

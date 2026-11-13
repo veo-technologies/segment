@@ -1,6 +1,6 @@
 //! An example showing how to send a single event to Segment.
 
-use segment::message::{Track, User};
+use segment::message::{Message, Track, User};
 use segment::{Client, HttpClient};
 use serde_json::json;
 
@@ -12,18 +12,15 @@ async fn main() -> segment::Result<()> {
     client
         .send(
             write_key,
-            Track {
-                user: User::UserId {
-                    user_id: "some_user_id".to_owned(),
-                },
+            &Message::from(Track {
+                user: User::user_id("some_user_id"),
                 event: "Example Event".to_owned(),
                 properties: json!({
                     "some property": "some value",
                     "some other property": "some other value",
                 }),
                 ..Default::default()
-            }
-            .into(),
+            }),
         )
         .await
         .expect("could not send to Segment");

@@ -1,21 +1,24 @@
 # Segment
 
-[![Test Status](https://github.com/irevoire/segment/workflows/Rust/badge.svg?event=push)](https://github.com/irevoire/segment/actions)
+[![Test Status](https://github.com/veo-technologies/segment/actions/workflows/rust.yml/badge.svg)](https://github.com/veo-technologies/segment/actions/workflows/rust.yml)
 [![API](https://docs.rs/segment/badge.svg)](https://docs.rs/segment)
 
-**This crate is an unofficial segment analytics client for Rust used by Meilisearch**
-- For additional documentation about **segment** visit <https://segment.com/docs/sources/#server>
-- For additional information about **Meilisearch** visit <https://github.com/meilisearch/meilisearch>
+An unofficial, async Rust client for the [Segment](https://segment.com/docs/sources/#server)
+Tracking API, maintained at [veo-technologies/segment](https://github.com/veo-technologies/segment).
 
 ## Requirements and features
 
-`segment` 0.3 targets Rust 1.85 or newer and uses the Rust 2024 edition.
+`segment` 0.4 targets Rust 1.88 or newer and uses the Rust 2024 edition.
 
-The default feature set enables `rustls-tls`, which maps to reqwest 0.13's
-`rustls` feature. To use native TLS instead:
+The default feature set enables `rustls-tls` (reqwest 0.13's `rustls` backend)
+and `gzip` (automatic gzip compression for JSON payloads >= 1024 bytes).
+
+Optional features:
+- `native-tls` / `native-tls-vendored`: use the platform TLS stack instead of `rustls-tls` (with `default-features = false`).
+- `tracing`: emit `tracing` spans/events for HTTP requests and retries.
 
 ```toml
-segment = { version = "0.3", default-features = false, features = ["native-tls"] }
+segment = { version = "0.4", default-features = false, features = ["native-tls", "gzip"] }
 ```
 
 ## Example usage(s)
@@ -39,7 +42,7 @@ async fn main() -> segment::Result<()> {
         .build()?;
 
     analytics.track(Track {
-        user: User::UserId { user_id: "user-123".to_owned() },
+        user: User::user_id("user-123"),
         event: "Example Event".to_owned(),
         properties: json!({ "source": "rust" }),
         ..Default::default()
@@ -54,9 +57,23 @@ enrichment and filtering. `analytics.subscribe()` returns a non-blocking
 broadcast stream of enqueue, delivery, failure, queue-pressure, and shutdown
 events for metrics and logging.
 
-Workspace configuration belongs to the separate `segment-public-api` workspace
-crate. Its complete typed client is generated from Segment's official OpenAPI
-document and uses Public API bearer tokens rather than Tracking API write keys.
+Workspace configuration belongs to the separate `segment-public-api` (`0.4`)
+workspace crate. Its complete typed client is generated from Segment's official
+Public API OpenAPI specification (`74.0.1`) and uses Public API bearer tokens
+rather than Tracking API write keys.
+
+For EU data residency, configure the regional endpoint via `HttpClient::builder`:
+
+```rust,no_run
+use segment::HttpClient;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> segment::Result<()> {
+    let client = HttpClient::builder().eu1().build()?;
+    let _ = client;
+    Ok(())
+}
+```
 
 The lower-level batching APIs remain available when the application owns its
 delivery loop:
@@ -77,14 +94,10 @@ async fn main() -> segment::Result<()> {
     // Pretend this is reading off of a queue, a file, or some other data
     // source.
     for i in 0..100 {
-        let msg = Track {
-            user: User::UserId { user_id: format!("user-{}", i) },
-            event: "Example Event".to_owned(),
-            properties: json!({
-                "foo": format!("bar-{}", i),
-            }),
-            ..Default::default()
-        };
+        let mut msg = Track::new(User::user_id(format!("user-{i}")), "Example Event");
+        msg.properties = json!({
+            "foo": format!("bar-{i}"),
+        });
 
         // An error here indicates a message is too large. In real life, you
         // would probably want to put this message in a deadletter queue or some
@@ -109,8 +122,8 @@ async fn main() -> segment::Result<()> {
     let write_key = "YOUR_WRITE_KEY";
 
     let client = HttpClient::default();
-    client.send(write_key, Message::from(Track {
-        user: User::UserId { user_id: "some_user_id".to_owned() },
+    client.send(write_key, &Message::from(Track {
+        user: User::user_id("some_user_id"),
         event: "Example Event".to_owned(),
         properties: json!({
             "some property": "some value",

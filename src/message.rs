@@ -126,7 +126,9 @@ impl Message {
         }
     }
 
-    pub(crate) fn prepare(&mut self) -> Result<()> {
+    /// Validate this message and populate any missing `messageId`, library
+    /// context, or batch `sentAt` metadata.
+    pub fn prepare(&mut self) -> Result<()> {
         self.validate()?;
 
         match self {
@@ -185,6 +187,17 @@ pub struct Identify {
     pub extra: Map<String, Value>,
 }
 
+impl Identify {
+    /// Construct a new `Identify` message with the given user and traits.
+    pub fn new(user: User, traits: Value) -> Self {
+        Self {
+            user,
+            traits,
+            ..Default::default()
+        }
+    }
+}
+
 /// A track event.
 ///
 /// See [Segment's documentation](https://segment.com/docs/spec/track/) for
@@ -221,6 +234,18 @@ pub struct Track {
     /// Extra fields to put at the top level of this message.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Track {
+    /// Construct a new `Track` message with the given user and event name.
+    pub fn new(user: User, event: impl Into<String>) -> Self {
+        Self {
+            user,
+            event: event.into(),
+            properties: json!({}),
+            ..Default::default()
+        }
+    }
 }
 
 /// A page event.
@@ -262,6 +287,18 @@ pub struct Page {
     pub extra: Map<String, Value>,
 }
 
+impl Page {
+    /// Construct a new `Page` message with the given user and page name.
+    pub fn new(user: User, name: impl Into<String>) -> Self {
+        Self {
+            user,
+            name: name.into(),
+            properties: json!({}),
+            ..Default::default()
+        }
+    }
+}
+
 /// A screen event.
 ///
 /// See [Segment's documentation](https://segment.com/docs/spec/screen/) for how
@@ -299,6 +336,18 @@ pub struct Screen {
     /// Extra fields to put at the top level of this message.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Screen {
+    /// Construct a new `Screen` message with the given user and screen name.
+    pub fn new(user: User, name: impl Into<String>) -> Self {
+        Self {
+            user,
+            name: name.into(),
+            properties: json!({}),
+            ..Default::default()
+        }
+    }
 }
 
 /// A group event.
@@ -340,6 +389,18 @@ pub struct Group {
     pub extra: Map<String, Value>,
 }
 
+impl Group {
+    /// Construct a new `Group` message with the given user and group ID.
+    pub fn new(user: User, group_id: impl Into<String>) -> Self {
+        Self {
+            user,
+            group_id: group_id.into(),
+            traits: json!({}),
+            ..Default::default()
+        }
+    }
+}
+
 /// An alias event.
 ///
 /// See [Segment's documentation](https://segment.com/docs/spec/alias/) for how
@@ -373,6 +434,17 @@ pub struct Alias {
     /// Extra fields to put at the top level of this message.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Alias {
+    /// Construct a new `Alias` message linking `previous_id` to `user_id`.
+    pub fn new(user_id: impl Into<String>, previous_id: impl Into<String>) -> Self {
+        Self {
+            user: User::user_id(user_id),
+            previous_id: previous_id.into(),
+            ..Default::default()
+        }
+    }
 }
 
 /// A batch of events.
@@ -420,17 +492,7 @@ where
 }
 
 fn fixed_precision_timestamp(timestamp: &Timestamp) -> String {
-    let value = timestamp.to_string();
-    let without_zone = value
-        .strip_suffix('Z')
-        .expect("jiff timestamps are formatted in UTC");
-    let (seconds, fraction) = without_zone.split_once('.').unwrap_or((without_zone, ""));
-    let mut fraction = fraction.to_owned();
-    fraction.truncate(9);
-    while fraction.len() < 9 {
-        fraction.push('0');
-    }
-    format!("{seconds}.{fraction}Z")
+    format!("{timestamp:.9}")
 }
 
 /// An enum containing all messages which may be placed inside a batch.
@@ -487,7 +549,9 @@ impl BatchMessage {
         }
     }
 
-    pub(crate) fn prepare(&mut self) -> Result<()> {
+    /// Validate this message and populate any missing `messageId` and library
+    /// context metadata.
+    pub fn prepare(&mut self) -> Result<()> {
         self.validate()?;
         match self {
             Self::Identify(message) => {
@@ -500,6 +564,22 @@ impl BatchMessage {
             Self::Alias(message) => prepare_common(&mut message.message_id, &mut message.context),
         }
         Ok(())
+    }
+
+    pub(crate) fn is_prepared(&self) -> bool {
+        let context = match self {
+            Self::Identify(message) => message.context.as_ref(),
+            Self::Track(message) => message.context.as_ref(),
+            Self::Page(message) => message.context.as_ref(),
+            Self::Screen(message) => message.context.as_ref(),
+            Self::Group(message) => message.context.as_ref(),
+            Self::Alias(message) => message.context.as_ref(),
+        };
+        self.message_id().is_some()
+            && matches!(
+                context,
+                Some(Value::Object(map)) if map.get("library").is_some_and(Value::is_object)
+            )
     }
 
     pub(crate) fn timestamp_mut(&mut self) -> &mut Option<Timestamp> {
@@ -753,6 +833,30 @@ pub enum User {
         #[serde(rename = "anonymousId")]
         anonymous_id: String,
     },
+}
+
+impl User {
+    /// Construct a `User` identified only by a `userId`.
+    pub fn user_id(user_id: impl Into<String>) -> Self {
+        Self::UserId {
+            user_id: user_id.into(),
+        }
+    }
+
+    /// Construct a `User` identified only by an `anonymousId`.
+    pub fn anonymous_id(anonymous_id: impl Into<String>) -> Self {
+        Self::AnonymousId {
+            anonymous_id: anonymous_id.into(),
+        }
+    }
+
+    /// Construct a `User` identified by both a `userId` and an `anonymousId`.
+    pub fn both(user_id: impl Into<String>, anonymous_id: impl Into<String>) -> Self {
+        Self::Both {
+            user_id: user_id.into(),
+            anonymous_id: anonymous_id.into(),
+        }
+    }
 }
 
 impl Display for User {
@@ -1116,5 +1220,75 @@ mod tests {
         }))
         .expect_err("untyped page/screen payload should be rejected");
         assert!(ambiguous.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn fixed_precision_timestamp_formats_nine_nanosecond_digits() {
+        let whole = Timestamp::from_second(1_700_000_000).unwrap();
+        assert_eq!(
+            fixed_precision_timestamp(&whole),
+            "2023-11-14T22:13:20.000000000Z"
+        );
+
+        let fractional = Timestamp::new(1_700_000_000, 123_450_000).unwrap();
+        assert_eq!(
+            fixed_precision_timestamp(&fractional),
+            "2023-11-14T22:13:20.123450000Z"
+        );
+    }
+
+    #[test]
+    fn ergonomic_constructors_produce_valid_messages() {
+        let uid = User::user_id("u1");
+        assert_eq!(
+            uid,
+            User::UserId {
+                user_id: "u1".to_owned()
+            }
+        );
+        let anon = User::anonymous_id("a1");
+        assert_eq!(
+            anon,
+            User::AnonymousId {
+                anonymous_id: "a1".to_owned()
+            }
+        );
+        let both = User::both("u1", "a1");
+        assert_eq!(
+            both,
+            User::Both {
+                user_id: "u1".to_owned(),
+                anonymous_id: "a1".to_owned()
+            }
+        );
+
+        let track = Track::new(User::user_id("u1"), "Signed Up");
+        assert_eq!(track.event, "Signed Up");
+        assert_eq!(track.properties, json!({}));
+        Message::from(track).validate().unwrap();
+
+        let identify = Identify::new(User::user_id("u1"), json!({ "plan": "pro" }));
+        assert_eq!(identify.traits, json!({ "plan": "pro" }));
+        Message::from(identify).validate().unwrap();
+
+        let page = Page::new(User::anonymous_id("a1"), "Pricing");
+        assert_eq!(page.name, "Pricing");
+        assert_eq!(page.properties, json!({}));
+        Message::from(page).validate().unwrap();
+
+        let screen = Screen::new(User::anonymous_id("a1"), "Home");
+        assert_eq!(screen.name, "Home");
+        assert_eq!(screen.properties, json!({}));
+        Message::from(screen).validate().unwrap();
+
+        let group = Group::new(User::user_id("u1"), "g1");
+        assert_eq!(group.group_id, "g1");
+        assert_eq!(group.traits, json!({}));
+        Message::from(group).validate().unwrap();
+
+        let alias = Alias::new("u1", "a1");
+        assert_eq!(alias.user, User::user_id("u1"));
+        assert_eq!(alias.previous_id, "a1");
+        Message::from(alias).validate().unwrap();
     }
 }

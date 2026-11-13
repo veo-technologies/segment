@@ -1,37 +1,39 @@
 [package]
 name = "segment-public-api"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "MIT"
-repository = "https://github.com/irevoire/segment"
+version = "0.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Generated Rust client for the Segment Public API"
 keywords = ["segment", "analytics", "openapi", "management"]
+categories = ["api-bindings", "web-programming::http-client", "asynchronous"]
 readme = "README.md"
 
 [dependencies]
-bytes = "1"
-futures-core = "0.3"
-progenitor-client = "=0.11.2"
-reqwest = { version = "0.12.4", features = ["json", "stream"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_urlencoded = "0.7"
-thiserror = "2"
+bytes.workspace = true
+futures-core.workspace = true
+percent-encoding.workspace = true
+progenitor-client.workspace = true
+reqwest = { workspace = true, features = ["query", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+thiserror.workspace = true
 
 [build-dependencies]
-openapiv3 = "2.2"
-prettyplease = "0.2"
-progenitor = { version = "=0.11.2", default-features = false }
-regress = "=0.10.4"
-serde_json = "1"
-syn = "2"
+openapiv3.workspace = true
+prettyplease.workspace = true
+progenitor.workspace = true
+regress.workspace = true
+serde_json.workspace = true
+syn.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.28.1", features = ["macros", "rt"], default-features = false }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default = ["rustls-tls"]
-rustls-tls = ["reqwest/rustls-tls"]
+rustls-tls = ["reqwest/rustls"]
 native-tls = ["reqwest/native-tls"]
 native-tls-vendored = ["reqwest/native-tls-vendored"]

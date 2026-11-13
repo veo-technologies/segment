@@ -38,14 +38,14 @@ pub(crate) const MAX_BATCH_SIZE: usize = 500_000;
 ///         // When this occurs, we flush the batcher, create a new batcher, and add
 ///         // the message into the new batcher.
 ///         if let Some(msg) = batcher.push(msg)? {
-///             client.send(write_key, batcher.into_message()).await?;
+///             client.send(write_key, &batcher.into_message()).await?;
 ///             batcher = Batcher::new(None);
 ///             batcher.push(msg)?;
 ///         }
 ///     }
 ///
 ///     if !batcher.is_empty() {
-///         client.send(write_key, batcher.into_message()).await?;
+///         client.send(write_key, &batcher.into_message()).await?;
 ///     }
 ///     Ok(())
 /// }
@@ -74,6 +74,30 @@ pub struct Batcher {
     pub(crate) auto_timestamp: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedBatchMessage {
+    pub(crate) message: BatchMessage,
+    pub(crate) serialized_size: usize,
+}
+
+impl PreparedBatchMessage {
+    pub(crate) fn new(mut message: BatchMessage, auto_timestamp: bool) -> Result<Self> {
+        let timestamp = message.timestamp_mut();
+        if auto_timestamp && timestamp.is_none() {
+            *timestamp = Some(Timestamp::now());
+        }
+        message.prepare()?;
+        let serialized_size = serde_json::to_vec(&message)?.len();
+        if serialized_size > MAX_MESSAGE_SIZE {
+            return Err(Error::MessageTooLarge);
+        }
+        Ok(Self {
+            message,
+            serialized_size,
+        })
+    }
+}
+
 impl Batcher {
     /// Construct a new, empty batcher.
     ///
@@ -88,6 +112,11 @@ impl Batcher {
             context,
             auto_timestamp: true,
         }
+    }
+
+    pub fn with_auto_timestamp(mut self, enabled: bool) -> Self {
+        self.auto_timestamp = enabled;
+        self
     }
 
     pub fn without_auto_timestamp(&mut self) {
@@ -123,38 +152,45 @@ impl Batcher {
             return Err(ValidationError::new("context", "must be a JSON object").into());
         }
 
-        let mut msg: BatchMessage = msg.into();
-        let timestamp = msg.timestamp_mut();
-        if self.auto_timestamp && timestamp.is_none() {
-            *timestamp = Some(Timestamp::now());
-        }
-        msg.prepare()?;
-        let size = serde_json::to_vec(&msg)?.len();
-        if size > MAX_MESSAGE_SIZE {
-            return Err(Error::MessageTooLarge);
+        let prepared = PreparedBatchMessage::new(msg.into(), self.auto_timestamp)?;
+        self.push_prepared(prepared)
+            .map(|opt| opt.map(|p| p.message))
+    }
+
+    pub(crate) fn push_prepared(
+        &mut self,
+        prepared: PreparedBatchMessage,
+    ) -> Result<Option<PreparedBatchMessage>> {
+        if self
+            .context
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(ValidationError::new("context", "must be a JSON object").into());
         }
 
         let separator_size = usize::from(!self.buf.is_empty());
-        let byte_count = self.byte_count + separator_size + size;
+        let byte_count = self.byte_count + separator_size + prepared.serialized_size;
         if self.buf.len() == MAX_BATCH_MESSAGES || byte_count > MAX_BATCH_SIZE {
             if self.buf.is_empty() {
                 return Err(Error::BatchTooLarge);
             }
-            return Ok(Some(msg));
+            return Ok(Some(prepared));
         }
 
         self.byte_count = byte_count;
-        self.buf.push(msg);
+        self.buf.push(prepared.message);
         Ok(None)
     }
 
-    pub(crate) fn take(&mut self) -> Vec<BatchMessage> {
+    pub(crate) fn take_with_size(&mut self) -> (Vec<BatchMessage>, usize) {
+        let byte_count = self.byte_count;
         self.byte_count = self.empty_batch_size;
-        std::mem::take(&mut self.buf)
+        (std::mem::take(&mut self.buf), byte_count)
     }
 
-    pub(crate) fn restore(&mut self, messages: Vec<BatchMessage>) {
-        self.byte_count = serialized_batch_size(&messages, self.context.as_ref());
+    pub(crate) fn restore_with_size(&mut self, messages: Vec<BatchMessage>, byte_count: usize) {
+        self.byte_count = byte_count;
         self.buf = messages;
     }
 
