@@ -1,12 +1,16 @@
-# Segment Public API client
+# Veo Segment Public API client
 
-`segment-public-api` is a generated, typed Rust client for Segment's
-management-plane Public API. It is intentionally separate from the `segment`
+`veo-segment-public-api` is a generated, typed Rust client for Segment's
+management-plane Public API. It is intentionally separate from the `veo-segment`
 crate, which sends events to the Tracking API with a source write key.
 
 The complete client surface is generated from Segment Public API OpenAPI
 `74.0.1`, including Sources, Destinations, Warehouses, Tracking Plans, Catalog,
 IAM, Audiences, Functions, and usage APIs.
+
+```toml
+veo-segment-public-api = "0.4"
+```
 
 ```rust,no_run
 use segment_public_api::Client;

@@ -33,7 +33,7 @@ jobs:
     - name: Test native TLS feature
       run: cargo test --workspace --release --no-default-features --features native-tls
     - name: Test all features
-      run: cargo test -p segment --release --all-features
+      run: cargo test -p veo-segment --release --all-features
 
   clippy:
     name: Run Clippy / Rust ${{ matrix.toolchain }}

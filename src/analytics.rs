@@ -413,78 +413,51 @@ impl Analytics {
     /// Stop accepting messages and drain the queue within `timeout`.
     ///
     /// A failed or timed-out drain reopens the client so the caller can retry.
+    /// The drain runs to completion even if this future is dropped, so a
+    /// cancelled close never leaves the client stuck in `Closing`.
     pub async fn close_and_flush_with_timeout(&self, timeout: Duration) -> Result<()> {
-        let receiver = {
-            let mut state = self.inner.state.lock().await;
-            if *state != State::Open {
-                return Err(Error::ClientClosed);
-            }
-            *state = State::Closing;
-            let (sender, receiver) = oneshot::channel();
-            if self
-                .inner
-                .sender
-                .send(Command::Flush {
-                    sender,
-                    reason: FlushReason::Shutdown,
-                })
-                .await
-                .is_err()
-            {
-                *state = State::Open;
-                return Err(Error::WorkerStopped);
-            }
-            receiver
-        };
-
-        let result = match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(Error::WorkerStopped),
-            Err(_) => Err(Error::FlushTimeout(timeout)),
-        };
-
-        if let Err(error) = result {
-            *self.inner.state.lock().await = State::Open;
-            return Err(error);
-        }
-
-        let (sender, receiver) = oneshot::channel();
-        self.inner
-            .sender
-            .send(Command::Shutdown(sender))
+        // The transition runs in its own task so that dropping this future
+        // cannot leave the client stuck in `Closing`.
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(close_and_flush(inner, timeout))
             .await
-            .map_err(|_| Error::WorkerStopped)?;
-        receiver.await.map_err(|_| Error::WorkerStopped)?;
-        *self.inner.state.lock().await = State::Closed;
-        publish(&self.inner.events, AnalyticsEvent::Closed);
-        Ok(())
+            .map_err(|_| Error::WorkerStopped)?
     }
 
     async fn flush_inner(&self, timeout: Option<Duration>) -> Result<()> {
-        let receiver = {
-            let state = self.inner.state.lock().await;
-            if *state != State::Open {
-                return Err(Error::ClientClosed);
-            }
-            let (sender, receiver) = oneshot::channel();
-            self.inner
-                .sender
-                .send(Command::Flush {
-                    sender,
-                    reason: FlushReason::Manual,
-                })
-                .await
-                .map_err(|_| Error::WorkerStopped)?;
-            receiver
+        let Some(timeout) = timeout else {
+            let receiver = self.admit_flush().await?;
+            return receiver.await.map_err(|_| Error::WorkerStopped)?;
         };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let receiver = tokio::time::timeout_at(deadline, self.admit_flush())
+            .await
+            .map_err(|_| Error::FlushTimeout(timeout))??;
+        tokio::time::timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| Error::FlushTimeout(timeout))?
+            .map_err(|_| Error::WorkerStopped)?
+    }
 
-        match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, receiver).await {
-                Ok(result) => result.map_err(|_| Error::WorkerStopped)?,
-                Err(_) => Err(Error::FlushTimeout(timeout)),
-            },
-            None => receiver.await.map_err(|_| Error::WorkerStopped)?,
+    /// Queue a manual flush behind every message accepted so far.
+    ///
+    /// Nothing is mutated unless the command is sent, so dropping this future
+    /// at any await point leaves the client unchanged.
+    async fn admit_flush(&self) -> Result<oneshot::Receiver<Result<()>>> {
+        let state = self.inner.state.lock().await;
+        if *state != State::Open {
+            return Err(Error::ClientClosed);
         }
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .sender
+            .send(Command::Flush {
+                sender,
+                reason: FlushReason::Manual,
+            })
+            .await
+            .map_err(|_| Error::WorkerStopped)?;
+        Ok(receiver)
     }
 }
 
@@ -526,13 +499,19 @@ async fn run_worker<C>(
     let timer = tokio::time::sleep(flush_interval);
     tokio::pin!(timer);
     let mut accepted_since_flush = 0;
+    let mut capacity_blocked = false;
 
     loop {
         tokio::select! {
-            command = receiver.recv() => match command {
+            // A failed rollover retains its overflow event. Stop consuming
+            // producers until a periodic retry succeeds instead of growing
+            // AutoBatcher's pending queue without bound. Once all senders
+            // disappear, the remaining channel contents are already bounded.
+            command = receiver.recv(), if !capacity_blocked || receiver.is_closed() => match command {
                 Some(Command::Event(prepared)) => {
                     accepted_since_flush += 1;
                     let result = push_observed(&mut batcher, *prepared, &events).await;
+                    capacity_blocked = result.is_err();
                     if result.is_ok()
                         && accepted_since_flush >= flush_at
                         && flush_observed(&mut batcher, FlushReason::MessageCount, &events).await.is_ok()
@@ -559,6 +538,7 @@ async fn run_worker<C>(
             () = &mut timer => {
                 if flush_observed(&mut batcher, FlushReason::Interval, &events).await.is_ok() {
                     accepted_since_flush = 0;
+                    capacity_blocked = false;
                 }
                 timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
@@ -676,6 +656,57 @@ where
     }
 }
 
+async fn close_and_flush(inner: Arc<Inner>, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let receiver = {
+        let mut state = tokio::time::timeout_at(deadline, inner.state.lock())
+            .await
+            .map_err(|_| Error::FlushTimeout(timeout))?;
+        if *state != State::Open {
+            return Err(Error::ClientClosed);
+        }
+        *state = State::Closing;
+        let (sender, receiver) = oneshot::channel();
+        let command = Command::Flush {
+            sender,
+            reason: FlushReason::Shutdown,
+        };
+        match tokio::time::timeout_at(deadline, inner.sender.send(command)).await {
+            Ok(Ok(())) => receiver,
+            Ok(Err(_)) => {
+                *state = State::Open;
+                return Err(Error::WorkerStopped);
+            }
+            Err(_) => {
+                *state = State::Open;
+                return Err(Error::FlushTimeout(timeout));
+            }
+        }
+    };
+
+    let result = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Error::WorkerStopped),
+        Err(_) => Err(Error::FlushTimeout(timeout)),
+    };
+    if let Err(error) = result {
+        *inner.state.lock().await = State::Open;
+        return Err(error);
+    }
+
+    let (sender, receiver) = oneshot::channel();
+    let shutdown = match inner.sender.send(Command::Shutdown(sender)).await {
+        Ok(()) => receiver.await.map_err(|_| Error::WorkerStopped),
+        Err(_) => Err(Error::WorkerStopped),
+    };
+    // The worker has shut down or is gone; `Closed` is terminal either way.
+    *inner.state.lock().await = State::Closed;
+    if shutdown.is_ok() {
+        publish(&inner.events, AnalyticsEvent::Closed);
+    }
+    shutdown
+}
+
 fn publish(events: &broadcast::Sender<AnalyticsEvent>, event: AnalyticsEvent) {
     let _ = events.send(event);
 }
@@ -761,6 +792,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct BlockingFailOnceClient {
+        sent: Arc<StdMutex<Vec<Message>>>,
+        blocked: Arc<AtomicBool>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Client for BlockingFailOnceClient {
+        async fn send<'a>(&'a self, _write_key: &'a str, message: &'a Message) -> Result<()> {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+                return Err(Error::Middleware("simulated delivery failure".to_owned()));
+            }
+            self.sent
+                .lock()
+                .expect("recording client lock was poisoned")
+                .push(message.clone());
+            Ok(())
+        }
+    }
+
     fn track(event: &str) -> Track {
         Track {
             user: User::UserId {
@@ -788,6 +842,99 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outage_preserves_queue_backpressure_and_recovers_without_loss() {
+        #[derive(Clone)]
+        struct OfflineClient {
+            offline: Arc<AtomicBool>,
+            sent: Arc<StdMutex<Vec<Message>>>,
+        }
+
+        impl Client for OfflineClient {
+            async fn send<'a>(&'a self, _write_key: &'a str, message: &'a Message) -> Result<()> {
+                if self.offline.load(Ordering::SeqCst) {
+                    return Err(Error::Middleware("offline".to_owned()));
+                }
+                self.sent
+                    .lock()
+                    .expect("recording lock")
+                    .push(message.clone());
+                Ok(())
+            }
+        }
+
+        let offline = Arc::new(AtomicBool::new(true));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let analytics = Analytics::builder_with_client(
+            "write-key",
+            OfflineClient {
+                offline: Arc::clone(&offline),
+                sent: Arc::clone(&sent),
+            },
+        )
+        .batch_context(json!({ "padding": "x".repeat(490_000) }))
+        .flush_at(100)
+        .flush_interval(Duration::from_secs(1))
+        .max_queue_size(2)
+        .overflow_policy(OverflowPolicy::Reject)
+        .build()
+        .expect("client should build");
+        let mut events = analytics.subscribe();
+        let large_track = |event: &str| {
+            let mut message = track(event);
+            message.properties = json!({ "padding": "x".repeat(6_000) });
+            message
+        };
+        analytics
+            .track(large_track("One"))
+            .await
+            .expect("first event");
+        analytics
+            .track(large_track("Two"))
+            .await
+            .expect("rollover event");
+        loop {
+            if matches!(
+                events.recv().await.expect("lifecycle event"),
+                AnalyticsEvent::DeliveryFailed {
+                    reason: FlushReason::Capacity,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        analytics
+            .track(large_track("Three"))
+            .await
+            .expect("queue slot one");
+        analytics
+            .track(large_track("Four"))
+            .await
+            .expect("queue slot two");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            analytics.track(large_track("Rejected")).await,
+            Err(Error::QueueFull)
+        ));
+
+        offline.store(false, Ordering::SeqCst);
+        analytics.close_and_flush().await.expect("recovered drain");
+        let sent = sent.lock().expect("recording lock");
+        let names: Vec<_> = sent
+            .iter()
+            .flat_map(|message| match message {
+                Message::Batch(batch) => &batch.batch,
+                _ => panic!("expected batch"),
+            })
+            .map(|message| match message {
+                BatchMessage::Track(track) => track.event.as_str(),
+                _ => panic!("expected track"),
+            })
+            .collect();
+        assert_eq!(names, ["One", "Two", "Three", "Four"]);
     }
 
     #[tokio::test]
@@ -942,6 +1089,137 @@ mod tests {
             delivered_message_count(&sent.lock().expect("lock should not be poisoned")),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn flush_timeout_bounds_queue_admission() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let client = BlockingOnceClient {
+            sent: Arc::clone(&sent),
+            blocked: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let entered = Arc::clone(&client.entered);
+        let release = Arc::clone(&client.release);
+        let analytics = Analytics::builder_with_client("write-key", client)
+            .flush_at(100)
+            .flush_interval(Duration::from_secs(60))
+            .max_queue_size(1)
+            .build()
+            .expect("client should build");
+
+        analytics
+            .track(track("One"))
+            .await
+            .expect("event should queue");
+        let flushing = tokio::spawn({
+            let analytics = analytics.clone();
+            async move { analytics.flush().await }
+        });
+        entered.notified().await;
+
+        // The worker is blocked in the client with an empty queue. Fill the
+        // single slot, then park a producer behind it holding the state lock.
+        analytics
+            .track(track("Two"))
+            .await
+            .expect("event should fill the queue");
+        let parked_producer = tokio::spawn({
+            let analytics = analytics.clone();
+            async move { analytics.track(track("Three")).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            analytics.flush_with_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .expect("flush_with_timeout must not wait on queue admission past its timeout");
+        assert!(matches!(result, Err(Error::FlushTimeout(_))));
+
+        release.notify_one();
+        flushing
+            .await
+            .expect("flush task should not panic")
+            .expect("first flush should deliver");
+        parked_producer
+            .await
+            .expect("producer task should not panic")
+            .expect("parked producer should enqueue once space frees");
+        analytics
+            .close_and_flush()
+            .await
+            .expect("close should succeed");
+        assert_eq!(
+            delivered_message_count(&sent.lock().expect("lock should not be poisoned")),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_does_not_wedge_the_client() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let client = BlockingFailOnceClient {
+            sent: Arc::clone(&sent),
+            blocked: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let entered = Arc::clone(&client.entered);
+        let release = Arc::clone(&client.release);
+        let analytics = Analytics::builder_with_client("write-key", client)
+            .flush_at(100)
+            .flush_interval(Duration::from_secs(60))
+            .build()
+            .expect("client should build");
+
+        analytics
+            .track(track("One"))
+            .await
+            .expect("event should queue");
+        let closing = tokio::spawn({
+            let analytics = analytics.clone();
+            async move {
+                analytics
+                    .close_and_flush_with_timeout(Duration::from_secs(60))
+                    .await
+            }
+        });
+        entered.notified().await;
+        closing.abort();
+        assert!(
+            closing
+                .await
+                .expect_err("closing caller should be cancelled")
+                .is_cancelled()
+        );
+
+        release.notify_one();
+        let mut retry = None;
+        for _ in 0..100 {
+            match analytics.flush().await {
+                Err(Error::ClientClosed) => tokio::task::yield_now().await,
+                result => {
+                    retry = Some(result);
+                    break;
+                }
+            }
+        }
+        retry
+            .expect("client should reopen after the cancelled close fails")
+            .expect("retry flush should deliver");
+        assert_eq!(
+            delivered_message_count(&sent.lock().expect("lock should not be poisoned")),
+            1
+        );
+        analytics
+            .close_and_flush()
+            .await
+            .expect("close should succeed");
     }
 
     #[tokio::test]

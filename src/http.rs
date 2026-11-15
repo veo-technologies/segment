@@ -329,12 +329,7 @@ impl Client for HttpClient {
             let result = request.body(body).send().await;
 
             let error = match result {
-                Ok(response)
-                    if !response.status().is_client_error()
-                        && !response.status().is_server_error() =>
-                {
-                    return Ok(());
-                }
+                Ok(response) if response.status().is_success() => return Ok(()),
                 Ok(response) => {
                     let status = response.status();
                     let headers = response.headers().clone();
@@ -628,6 +623,23 @@ mod tests {
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error.body, r#"{"code":"rate_limited"}"#);
         assert_eq!(error.headers["retry-after"], "12");
+    }
+
+    #[tokio::test]
+    async fn non_success_status_is_not_reported_as_delivered() {
+        let (host, _request_body) = serve_once("300 Multiple Choices", &[], "");
+        let client =
+            HttpClient::new(reqwest::Client::new(), host).with_retry_policy(RetryPolicy::none());
+
+        let error = client
+            .send("write-key", &track().into())
+            .await
+            .expect_err("3xx should not count as delivered");
+        let Error::ApiError(error) = error else {
+            panic!("expected a structured API error");
+        };
+        assert_eq!(error.status, StatusCode::MULTIPLE_CHOICES);
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test]

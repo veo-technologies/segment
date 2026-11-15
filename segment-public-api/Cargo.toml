@@ -1,5 +1,5 @@
 [package]
-name = "segment-public-api"
+name = "veo-segment-public-api"
 version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,10 @@ description = "Generated Rust client for the Segment Public API"
 keywords = ["segment", "analytics", "openapi", "management"]
 categories = ["api-bindings", "web-programming::http-client", "asynchronous"]
 readme = "README.md"
+documentation = "https://docs.rs/veo-segment-public-api"
+
+[lib]
+name = "segment_public_api"
 
 [dependencies]
 bytes.workspace = true

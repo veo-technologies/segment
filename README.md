@@ -1,14 +1,14 @@
-# Segment
+# Veo Segment
 
 [![Test Status](https://github.com/veo-technologies/segment/actions/workflows/rust.yml/badge.svg)](https://github.com/veo-technologies/segment/actions/workflows/rust.yml)
-[![API](https://docs.rs/segment/badge.svg)](https://docs.rs/segment)
+[![API](https://docs.rs/veo-segment/badge.svg)](https://docs.rs/veo-segment)
 
 An unofficial, async Rust client for the [Segment](https://segment.com/docs/sources/#server)
 Tracking API, maintained at [veo-technologies/segment](https://github.com/veo-technologies/segment).
 
 ## Requirements and features
 
-`segment` 0.4 targets Rust 1.88 or newer and uses the Rust 2024 edition.
+`veo-segment` 0.4 targets Rust 1.88 or newer and uses the Rust 2024 edition.
 
 The default feature set enables `rustls-tls` (reqwest 0.13's `rustls` backend)
 and `gzip` (automatic gzip compression for JSON payloads >= 1024 bytes).
@@ -18,7 +18,7 @@ Optional features:
 - `tracing`: emit `tracing` spans/events for HTTP requests and retries.
 
 ```toml
-segment = { version = "0.4", default-features = false, features = ["native-tls", "gzip"] }
+veo-segment = { version = "0.4", default-features = false, features = ["native-tls", "gzip"] }
 ```
 
 ## Example usage(s)
@@ -57,7 +57,16 @@ enrichment and filtering. `analytics.subscribe()` returns a non-blocking
 broadcast stream of enqueue, delivery, failure, queue-pressure, and shutdown
 events for metrics and logging.
 
-Workspace configuration belongs to the separate `segment-public-api` (`0.4`)
+The queue holds at most `max_queue_size` commands in addition to the worker's
+size-limited batch and one retained overflow event. When a capacity flush fails,
+the worker pauses queue consumption until a periodic retry succeeds; producers
+then wait or receive `QueueFull`, according to the overflow policy.
+Flush timeouts include waiting for queue space. Cancelling a close does not
+cancel the shutdown task; it finishes draining or reopens the client on failure.
+Call `close_and_flush` before stopping the Tokio runtime: dropping all handles
+only attempts a best-effort final flush, and the queue is not durable storage.
+
+Workspace configuration belongs to the separate `veo-segment-public-api` (`0.4`)
 workspace crate. Its complete typed client is generated from Segment's official
 Public API OpenAPI specification (`74.0.1`) and uses Public API bearer tokens
 rather than Tracking API write keys.
@@ -135,6 +144,27 @@ async fn main() -> segment::Result<()> {
     Ok(())
 }
 ```
+
+## 0.4.0 release notes
+
+- First crates.io release under the Veo package names, with existing Rust
+  library names preserved.
+- Upgraded to Rust 1.88, edition 2024, reqwest 0.13, and Public API OpenAPI 74.0.1.
+- Fixed non-2xx HTTP responses being reported as delivered.
+- Fixed flush timeouts excluding queue admission and cancelled closes leaving
+  the client stuck in its closing state.
+- Preserved bounded buffering during prolonged capacity-flush failures.
+
+## Migrating to 0.4
+
+The Veo-maintained fork is published as `veo-segment`, not the upstream
+`segment` crate. Change the dependency to `veo-segment = "0.4"`; the Rust
+library name and imports remain `segment`. The management client is published as
+`veo-segment-public-api`; its library name and imports remain `segment_public_api`.
+
+Version 0.4 requires Rust 1.88 / edition 2024 and upgrades to reqwest 0.13.
+Default features now include gzip. Applications using their own reqwest client
+must also migrate that client to reqwest 0.13.
 
 ## License
 
